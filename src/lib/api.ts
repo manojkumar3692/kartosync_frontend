@@ -74,6 +74,12 @@ export async function submitAICorrection(payload: {
   return data;
 }
 
+export async function aiFixOrder(id: string, human_fixed: { items: any[]; reason?: string }) {
+  const { data } = await api.post(`/api/orders/${id}/ai-fix`, { human_fixed });
+  return data;
+}
+
+
 export function logout() {
   localStorage.removeItem("token");
   setToken(undefined);
