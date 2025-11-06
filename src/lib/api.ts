@@ -2,7 +2,9 @@
 import axios from "axios";
 
 // Point to your running backend (override via VITE_API_BASE in .env)
-export const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8787";
+// export const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8787";
+// Always use relative API path → lets Vite proxy handle it
+export const API_BASE = import.meta.env.VITE_API_BASE || "";
 
 // Axios instance
 const api = axios.create({ baseURL: API_BASE });
@@ -124,6 +126,18 @@ export async function aiFixOrder(
 ) {
   const { data } = await api.post(`/api/orders/${id}/ai-fix`, { human_fixed });
   return data as { ok: true; order: Order };
+}
+
+// src/lib/api.ts
+export async function getClarifyLink(order_id: string, line_index: number, ttlSeconds?: number) {
+  const { data } = await api.post(`/api/clarify-link`, { order_id, line_index, ttlSeconds });
+  if (!data?.ok) throw new Error(data?.error || "clarify_link_failed");
+  return data.url as string;
+}
+
+export async function deleteOrder(orderId: string) {
+  const { data } = await api.delete(`/api/orders/${orderId}`);
+  return data;
 }
 
 // ─────────────────────────────────────────────────────────
