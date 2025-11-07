@@ -3,6 +3,7 @@
 import React, { useMemo, useState } from "react";
 import { aiFixOrder, getClarifyLink, updateStatus, deleteOrder } from "../lib/api";
 import { timeAgo, useTicker } from "../lib/time";
+import { OrderReasonChips } from "./OrderReasonChips";
 
 type Item = {
   qty: number | null;
@@ -85,6 +86,8 @@ function inquiryKind(parseReason?: string | null): "price" | "availability" | nu
   return null;
 }
 
+
+
 export default function OrderCard({ o, onChange }: { o: Order; onChange: () => void }) {
   const [showRaw, setShowRaw] = useState(false);
   const [showAudio, setShowAudio] = useState(false);
@@ -116,6 +119,9 @@ export default function OrderCard({ o, onChange }: { o: Order; onChange: () => v
       notes: i.notes ?? null,
     }))
   );
+
+  // src/components/OrderCard.tsx
+
 
   function openFix() {
     setFixItems(
@@ -171,6 +177,7 @@ export default function OrderCard({ o, onChange }: { o: Order; onChange: () => v
   const firstName = o.customer_name ? ` ${o.customer_name}` : "";
   const firstItem = (o.items && o.items[0]) || null;
   const itemLabel = (firstItem?.canonical || firstItem?.name || "").trim();
+  const edited = o.parse_reason ? o.parse_reason : ""
 
   const sendInquiryReply = (kind: "price" | "availability") => {
     if (!o.source_phone) return;
@@ -331,6 +338,7 @@ export default function OrderCard({ o, onChange }: { o: Order; onChange: () => v
               <span className="rounded-md border border-gray-200 bg-gray-50 px-1.5 py-0.5 text-[11px] text-gray-700">
                 {createdAgo}
               </span>
+              <OrderReasonChips parseReason={"fghjk"} className="justify-end" />
             </div>
             <div className="mt-1 text-[14px] font-semibold text-gray-900">
               {o.customer_name || o.source_phone || "Customer"}
