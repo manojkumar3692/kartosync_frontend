@@ -1,5 +1,6 @@
 // src/components/QuickReplyPrice.tsx
 import React, { useMemo, useState } from "react";
+import { sendInboxMessage } from "../lib/api";
 
 type Props = {
   /** Customer phone number (any format; digits are extracted) */
@@ -14,6 +15,13 @@ type Props = {
   currency?: string; // e.g., "AED", default: "AED"
   /** Optional container className for layout control */
   className?: string;
+
+  /** NEW: if "waba", send via backend instead of WA Web */
+  mode?: "waba" | "local";
+  /** NEW: required for WABA backend send */
+  orgId?: string | null;
+  /** NEW: optional callback when message successfully sent */
+  onSent?: () => void;
 };
 
 /** Minimal WA Web/Desktop deep link */
@@ -35,9 +43,13 @@ const QuickReplyPrice: React.FC<Props> = ({
   defaultPrice,
   currency = "AED",
   className,
+  mode = "local",
+  orgId,
+  onSent,
 }) => {
   const [price, setPrice] = useState<string>(defaultPrice || "");
   const [unit, setUnit] = useState<string>(""); // e.g., "per kg", "per pack"
+  const [sending, setSending] = useState(false);
 
   const hasPhone = !!(phone && String(phone).trim());
   const itemLabel = tidy(String(defaultItem || ""));
@@ -54,10 +66,29 @@ const QuickReplyPrice: React.FC<Props> = ({
     return `${line1}\n${line2}\n${line3}`;
   }, [price, unit, firstName, itemLabel]);
 
-  const openWA = () => {
+  const handleSend = async () => {
     if (!hasPhone) return;
+    const text = preview;
+
+    // NEW: WABA path → send via backend
+    if (mode === "waba" && orgId) {
+      try {
+        setSending(true);
+        const phonePlain = String(phone);
+        await sendInboxMessage(orgId, phonePlain, text);
+        if (onSent) onSent();
+      } catch (e) {
+        console.error(e);
+        alert("Could not send on WhatsApp. Please try again.");
+      } finally {
+        setSending(false);
+      }
+      return;
+    }
+
+    // OLD behaviour (kept): open WhatsApp Web/Desktop
     try {
-      const link = buildWAWebLink(String(phone), preview);
+      const link = buildWAWebLink(String(phone), text);
       window.open(link, "_blank", "noopener,noreferrer");
     } catch (e) {
       console.error(e);
@@ -70,7 +101,7 @@ const QuickReplyPrice: React.FC<Props> = ({
       <div className="mb-2 flex items-center justify-between">
         <div className="text-[12px] font-semibold text-purple-900">Quick Reply · Price</div>
         {!hasPhone && (
-          <span className="text-[11px] text-purple-700" title="Customer phone required to open WhatsApp">
+          <span className="text-[11px] text-purple-700" title="Customer phone required to open/send WhatsApp">
             Phone missing
           </span>
         )}
@@ -129,12 +160,18 @@ const QuickReplyPrice: React.FC<Props> = ({
           Copy text
         </button>
         <button
-          onClick={openWA}
-          disabled={!hasPhone}
+          onClick={handleSend}
+          disabled={!hasPhone || sending}
           className="rounded-md border border-purple-300 bg-purple-600 px-3 py-1 text-[12px] font-semibold text-white hover:bg-purple-700 disabled:opacity-50"
-          title={hasPhone ? "Open WhatsApp Web/Desktop" : "Customer phone required"}
+          title={
+            !hasPhone
+              ? "Customer phone required"
+              : mode === "waba"
+              ? "Send via WhatsApp Cloud API"
+              : "Open WhatsApp Web/Desktop"
+          }
         >
-          💬 Send in WhatsApp
+          {sending ? "Sending…" : "💬 Send in WhatsApp"}
         </button>
       </div>
     </div>

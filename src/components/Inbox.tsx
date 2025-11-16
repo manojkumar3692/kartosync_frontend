@@ -30,6 +30,7 @@ export default function Inbox() {
   const [pollMs] = useState(4000);
   const [latestOrder, setLatestOrder] = useState<any>(null);
   const lastSeenInboundId = useRef<string | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   // Load org (for org_id)
   useEffect(() => {
@@ -38,6 +39,14 @@ export default function Inbox() {
       setOrg(data?.org || data);
     })();
   }, []);
+
+  useEffect(() => {
+    if (!messagesEndRef.current) return;
+    messagesEndRef.current.scrollIntoView({
+      behavior: "smooth",
+      block: "end",
+    });
+  }, [msgs.length, activeId]);
 
   // Load conversations
   async function refreshConvs() {
@@ -157,7 +166,7 @@ export default function Inbox() {
       </div>
 
       {/* middle: chat thread + inline reply */}
-      <div className="flex flex-col">
+      <div className="flex-1 overflow-auto p-3">
         <div className="flex-1 overflow-auto p-3">
           {msgs.map((m) => (
             <div key={m.id} className={`mb-2 ${m.direction === "out" ? "text-right" : "text-left"}`}>

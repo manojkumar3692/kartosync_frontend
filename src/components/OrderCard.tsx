@@ -1,14 +1,24 @@
 // src/components/OrderCard.tsx
 // Brand/variant inline edit + per-line clarify + Inquiry quick replies + Delete order
+// + Operator overrides: Split to New Order (per line) & Merge with Previous (card-level)
+// + Price per line, order total & "Send summary" to WhatsApp / WABA
 import React, { useMemo, useState } from "react";
 import {
   aiFixOrder,
   getClarifyLink,
   updateStatus,
   deleteOrder,
+  splitOrderItems,
+  mergeWithPrevious,
+  sendInboxMessage,
 } from "../lib/api";
 import { timeAgo, useTicker } from "../lib/time";
 import { OrderReasonChips } from "./OrderReasonChips";
+
+// ─────────────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────────────
+const CURRENCY = "AED";
 
 // ─────────────────────────────────────────────────────
 // Types (keep in sync with backend / lib/api)
@@ -21,6 +31,11 @@ type Item = {
   brand?: string | null;
   variant?: string | null;
   notes?: string | null;
+  category?: string | null;
+
+  // optional pricing
+  price_per_unit?: number | null;
+  line_total?: number | null;
 };
 
 type Order = {
@@ -34,17 +49,15 @@ type Order = {
   items?: Item[];
   parse_reason?: string | null;
   parse_confidence?: number | null;
+  link_reason?: string | null;
 };
 
 type Props = {
   o: Order;
   onChange: () => void;
-  /**
-   * local  -> classic local_bridge behavior (WhatsApp links etc.)
-   * waba   -> Cloud API: hide WA links, use dashboard send
-   * auto   -> (future) infer from parse_reason, etc.
-   */
   modeHint?: "waba" | "local";
+  /** Needed so we can send messages over WhatsApp Cloud API instead of WA Web links */
+  orgId?: string;
 };
 
 // ─────────────────────────────────────────────────────
@@ -117,19 +130,52 @@ function inquiryKind(
   return null;
 }
 
+// Build order summary text with price lines + total
+// If prices are missing, the total will be 0.00 as a safe default.
+function buildOrderSummaryText(o: Order, subtotal: number) {
+  const name = (o.customer_name || "").trim();
+  const hi = name ? `Hi ${name},` : "Hi,";
+  const items = o.items || [];
+
+  const lines = items.map((it, idx) => {
+    const qty =
+      typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
+    const unit = it.unit ? ` ${it.unit}` : "";
+    const baseName = (it.canonical || it.name || "item").trim();
+    const brand = it.brand ? ` · ${it.brand}` : "";
+    const variant = it.variant ? ` · ${it.variant}` : "";
+
+    const price =
+      typeof it.price_per_unit === "number" && !Number.isNaN(it.price_per_unit)
+        ? it.price_per_unit
+        : null;
+    const lineTotal =
+      price != null ? price * qty : it.line_total != null ? it.line_total : 0;
+
+    if (price != null) {
+      return `${idx + 1}) ${qty}${unit} ${baseName}${brand}${variant} – ${CURRENCY} ${price.toFixed(
+        2
+      )} × ${qty} = ${CURRENCY} ${lineTotal.toFixed(2)}`;
+    }
+
+    // no price info → just item line
+    return `${idx + 1}) ${qty}${unit} ${baseName}${brand}${variant}`;
+  });
+
+  let text = `${hi} here is your order summary:\n\n${lines.join("\n")}`;
+  text += `\n\nTotal: ${CURRENCY} ${subtotal.toFixed(
+    2
+  )}\n\nReply YES to confirm.`;
+  return text;
+}
+
 // ─────────────────────────────────────────────────────
 
-export default function OrderCard({ o, onChange, modeHint }: Props) {
-  // WABA vs local_bridge: right now Dashboard passes this explicitly.
-  // Keep a tiny auto hook so we don't break if omitted.
+export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
   const isWaba = useMemo(() => {
     if (modeHint === "waba") return true;
     if (modeHint === "local") return false;
-
     const r = (o.parse_reason || "").toLowerCase();
-
-    // Your ingestCore can tag like:
-    // "src:waba", "source:waba", "ingest:waba", etc.
     if (
       r.includes("waba") &&
       (r.includes("src:") ||
@@ -139,8 +185,6 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
     ) {
       return true;
     }
-
-    // Explicit local tags if you add them:
     if (
       r.includes("local_bridge") ||
       r.includes("local-bridge") ||
@@ -149,10 +193,20 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
     ) {
       return false;
     }
-
-    // Default: treat as local_bridge-style (keeps WA links working)
     return false;
   }, [modeHint, o.parse_reason]);
+
+  const canSendWaba = !!(isWaba && orgId && o.source_phone);
+
+  async function sendWabaText(text: string) {
+    if (!canSendWaba || !orgId || !o.source_phone) return;
+    try {
+      await sendInboxMessage(orgId, o.source_phone, text);
+    } catch (e) {
+      console.error("[OrderCard] WABA send failed", e);
+      alert("Failed to send WhatsApp message. Please try again.");
+    }
+  }
 
   const [showRaw, setShowRaw] = useState(false);
   const [showAudio, setShowAudio] = useState(false);
@@ -171,6 +225,10 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
   const [clarLoading, setClarLoading] = useState<number | null>(null);
   const [waLoading, setWaLoading] = useState<number | null>(null);
 
+  // Operator overrides
+  const [splitBusy, setSplitBusy] = useState<number | null>(null);
+  const [mergeBusy, setMergeBusy] = useState(false);
+
   // Fix modal
   const [fixOpen, setFixOpen] = useState(false);
   const [fixReason, setFixReason] = useState("");
@@ -183,6 +241,9 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
       brand: i.brand ?? null,
       variant: i.variant ?? null,
       notes: i.notes ?? null,
+      category: i.category ?? null,
+      price_per_unit: i.price_per_unit ?? null,
+      line_total: i.line_total ?? null,
     }))
   );
 
@@ -196,6 +257,9 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
         brand: i.brand ?? null,
         variant: i.variant ?? null,
         notes: i.notes ?? null,
+        category: i.category ?? null,
+        price_per_unit: i.price_per_unit ?? null,
+        line_total: i.line_total ?? null,
       }))
     );
     setFixReason("");
@@ -219,6 +283,9 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
         brand: null,
         variant: null,
         notes: null,
+        category: null,
+        price_per_unit: null,
+        line_total: null,
       },
     ]);
   }
@@ -240,6 +307,15 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
         brand: (it.brand || "")?.trim() || null,
         variant: (it.variant || "")?.trim() || null,
         notes: (it.notes || "")?.trim() || null,
+         // ✅ keep pricing fields so DB can store them
+      price_per_unit:
+      it.price_per_unit == null || Number.isNaN(it.price_per_unit as any)
+        ? null
+        : Number(it.price_per_unit),
+    line_total:
+      it.line_total == null || Number.isNaN(it.line_total as any)
+        ? null
+        : Number(it.line_total),
       }))
       .filter((it) => (it.canonical || it.name)?.length);
     if (!cleaned.length) return;
@@ -269,8 +345,8 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
         ? [
             `Hi${firstName},`,
             itemLabel
-              ? `${itemLabel} – current price is AED ____ (per unit).`
-              : `Here’s the price you asked for: AED ____ .`,
+              ? `${itemLabel} – current price is ${CURRENCY} ____ (per unit).`
+              : `Here’s the price you asked for: ${CURRENCY} ____ .`,
             `Let me know if you’d like to place an order.`,
           ].join(" ")
         : [
@@ -305,6 +381,9 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
           brand,
           variant,
           notes: it.notes ?? null,
+          category: it.category ?? null,
+          price_per_unit: it.price_per_unit ?? null,
+          line_total: it.line_total ?? null,
         };
       });
 
@@ -320,6 +399,15 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
           brand: (x.brand || "")?.trim() || null,
           variant: (x.variant || "")?.trim() || null,
           notes: (x.notes || "")?.trim() || null,
+          // ✅ DON'T DROP THEM HERE
+    price_per_unit:
+    x.price_per_unit == null || Number.isNaN(x.price_per_unit as any)
+      ? null
+      : Number(x.price_per_unit),
+  line_total:
+    x.line_total == null || Number.isNaN(x.line_total as any)
+      ? null
+      : Number(x.line_total),
         })),
         reason: `inline_fix:item_${idx}`,
       });
@@ -336,7 +424,48 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
     }
   };
 
-  // Per-item WA (local_bridge only)
+  // Generic clarify handler – LOCAL: copy link; WABA: send directly
+  const handleClarifyClick = async (idx: number) => {
+    try {
+      setClarLoading(idx);
+      const url = await getClarifyLink(o.id, idx);
+
+      // NEW: WABA → send via backend (no manual copy)
+      if (isWaba && orgId && o.source_phone) {
+        const i = (o.items || [])[idx];
+        const base = (i?.canonical || i?.name || "item").trim();
+        const needBrand = !i?.brand || !i.brand.trim();
+        const needVariant = !i?.variant || !i.variant.trim();
+        const what =
+          needBrand && needVariant
+            ? "brand & variant"
+            : needBrand
+            ? "brand"
+            : "variant";
+
+        const msg =
+          `Hi${o.customer_name ? " " + o.customer_name : ""}, re: “${base}”.\n\n` +
+          `Please confirm the ${what} here:\n${url}\n\n` +
+          `Once you choose, we’ll pack it right away.`;
+
+        await sendInboxMessage(orgId, o.source_phone, msg);
+        alert("Clarify message sent to customer on WhatsApp.");
+      } else {
+        // OLD behaviour (kept): local / non-WABA → just copy link
+        await navigator.clipboard.writeText(url);
+        alert(
+          "Clarify link copied. Paste it into WhatsApp (or your tool) to send to the customer."
+        );
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Failed to create clarify link");
+    } finally {
+      setClarLoading(null);
+    }
+  };
+
+  // Per-item WA (LOCAL only)
   const sendPerItemWA = async (idx: number) => {
     if (!o.source_phone || isWaba) return;
     try {
@@ -366,7 +495,69 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
     }
   };
 
-  // (kept; handy for tooltips or future summary)
+  // WABA-only: per-line price quick reply
+  const sendPriceForLineWaba = async (idx: number) => {
+    if (!canSendWaba) return;
+    const it = (o.items || [])[idx];
+    if (!it) return;
+    const qty =
+      typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
+    const unit = it.unit ? ` ${it.unit}` : "";
+    const base = (it.canonical || it.name || "item").trim();
+    const brand = it.brand ? ` · ${it.brand}` : "";
+    const variant = it.variant ? ` · ${it.variant}` : "";
+    const price =
+      typeof it.price_per_unit === "number" && !Number.isNaN(it.price_per_unit)
+        ? it.price_per_unit
+        : null;
+
+    const name = (o.customer_name || "").trim();
+    const hi = name ? `Hi ${name},` : "Hi,";
+    const core = `${qty}${unit} ${base}${brand}${variant}`.trim();
+
+    const text =
+      price != null
+        ? `${hi} price for ${core} is ${CURRENCY} ${price.toFixed(
+            2
+          )} per${unit || " unit"}.`
+        : `${hi} price for ${core} is ${CURRENCY} 0.00 (please adjust if needed).`;
+
+    await sendWabaText(text);
+    alert("Price reply sent to the customer on WhatsApp.");
+  };
+
+  // Operator override: Split a single item into a new order
+  const splitOne = async (idx: number) => {
+    if (!o.items || idx < 0 || idx >= o.items.length) return;
+    if (!confirm("Split this line into a NEW order?")) return;
+    try {
+      setSplitBusy(idx);
+      await splitOrderItems(o.id, [idx]);
+      onChange();
+    } catch (e) {
+      console.error(e);
+      alert("Split failed.");
+    } finally {
+      setSplitBusy(null);
+    }
+  };
+
+  // Operator override: Merge this order with the previous open order (if any)
+  const mergePrev = async () => {
+    if (!confirm("Merge this order into the previous one?")) return;
+    try {
+      setMergeBusy(true);
+      await mergeWithPrevious(o.id);
+      onChange();
+    } catch (e) {
+      console.error(e);
+      alert("Merge failed.");
+    } finally {
+      setMergeBusy(false);
+    }
+  };
+
+  // Human-readable items line
   const itemsLine = useMemo(() => {
     const arr = (o.items || []).map((i) => {
       const qty = i.qty ?? 1;
@@ -378,6 +569,26 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
     });
     return arr.join(" · ");
   }, [o.items]);
+
+// Price subtotal: use price_per_unit if present, otherwise fall back to line_total
+const { subtotal, hasAnyPrice } = useMemo(() => {
+  let sum = 0;
+  let anyPrice = false;
+  (o.items || []).forEach((it) => {
+    const qty = typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
+    const price =
+      typeof it.price_per_unit === "number" && !Number.isNaN(it.price_per_unit)
+        ? it.price_per_unit
+        : null;
+    if (price != null) {
+      anyPrice = true;
+      sum += qty * price;
+    }
+  });
+  return { subtotal: sum, hasAnyPrice: anyPrice };
+}, [o.items]);
+
+
 
   async function setStatus(s: Order["status"]) {
     if (s === o.status) return;
@@ -419,12 +630,26 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
     }
   }
 
+  // Send summary / bill
+  const sendSummaryToCustomer = async () => {
+    if (!o.source_phone) return;
+    const text = buildOrderSummaryText(o, subtotal);
+
+    if (canSendWaba) {
+      await sendWabaText(text);
+      alert("Bill sent to the customer on WhatsApp.");
+    } else {
+      const link = buildWAWebLink(o.source_phone, text);
+      window.open(link, "_blank", "noopener,noreferrer");
+    }
+  };
+
   // ─────────────────────────────────────────────────────
   // RENDER
   // ─────────────────────────────────────────────────────
 
   return (
-    <div className="relative rounded-2xl border border-gray-200 bg-white shadow-sm w-full">
+    <div className="relative w-full rounded-2xl border border-gray-200 bg-white shadow-sm">
       {/* subtle left accent */}
       <div className="absolute inset-y-0 left-0 w-1 rounded-l-2xl bg-gradient-to-b from-indigo-300 to-emerald-300" />
 
@@ -451,11 +676,11 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
             <div className="mt-1 text-[14px] font-semibold text-gray-900">
               {o.customer_name || o.source_phone || "Customer"}
             </div>
-            {itemsLine && (
-              <div className="mt-0.5 text-[11px] text-gray-500 line-clamp-1">
+            {/* {itemsLine && (
+              <div className="mt-0.5 line-clamp-1 text-[11px] text-gray-500">
                 {itemsLine}
               </div>
-            )}
+            )} */}
           </div>
 
           {/* right-side actions */}
@@ -495,22 +720,49 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
               ✅ Paid
             </SegPill>
 
-            <button
-              className="rounded-full border border-rose-200 bg-rose-50 px-2.5 py-1 text-[12px] text-rose-700 hover:bg-rose-100"
-              onClick={openFix}
-              title="Wrong Parse → Fix"
-            >
-              ✏️ Wrong Parse → Fix
-            </button>
+            {/* Send summary / bill – works for LOCAL (WA Web) and WABA (Cloud API) */}
+            {o.source_phone && (
+              <button
+                className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[12px] text-emerald-800 hover:bg-emerald-100"
+                onClick={sendSummaryToCustomer}
+                title={
+                  canSendWaba
+                    ? "Send bill to customer on WhatsApp"
+                    : "Open WhatsApp Web with full order summary and total"
+                }
+              >
+                🧾 Send bill
+              </button>
+            )}
 
             <button
-              className="rounded-full border border-red-300 bg-red-50 px-2.5 py-1 text-[12px] text-red-700 hover:bg-red-100"
+              className="rounded-full border border-rose-200 bg-rose-50 px-2.5 py-1 text-[12px] text-rose-700 hover:bg-rose-100"
               onClick={onDelete}
               title="Delete this order"
             >
               🗑️ Delete
             </button>
           </div>
+        </div>
+
+        {/* Operator overrides (card level) */}
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <button
+            className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-[12px] hover:bg-gray-100"
+            onClick={openFix}
+            title="Wrong Parse → Fix"
+          >
+            ✏️ Wrong Parse → Fix
+          </button>
+
+          {/* <button
+            className="rounded-md border border-blue-300 bg-blue-50 px-2 py-1 text-[12px] text-blue-800 hover:bg-blue-100 disabled:opacity-50"
+            onClick={mergePrev}
+            disabled={mergeBusy}
+            title="Merge this order into the previous open order"
+          >
+            {mergeBusy ? "Merging…" : "↩︎ Merge with Previous"}
+          </button> */}
         </div>
 
         {/* Inquiry quick actions (LOCAL ONLY) */}
@@ -560,59 +812,93 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
                 const missingVariant = isBlank(i.variant);
                 const ambiguous = missingBrand || missingVariant;
 
+                const price =
+                  typeof i.price_per_unit === "number" &&
+                  !Number.isNaN(i.price_per_unit)
+                    ? i.price_per_unit
+                    : null;
+                const lineTotal =
+                  price != null
+                    ? price * (typeof i.qty === "number" ? i.qty : 1)
+                    : typeof i.line_total === "number"
+                    ? i.line_total
+                    : null;
+
                 return (
                   <div
                     key={idx}
                     className="flex items-center justify-between rounded-xl border border-gray-200 bg-gray-50 px-2.5 py-1.5"
                   >
                     {/* LEFT: text + inline edit */}
-                    <div className="flex min-w-0 flex-wrap items-center gap-2">
-                      <button
-                        className="truncate text-left"
-                        onClick={() => toggleEdit(idx)}
-                        title="Click to edit brand/variant inline"
-                      >
-                        <span className="font-medium text-gray-900">
-                          {qty}
-                          {unit} {base}
-                        </span>{" "}
-                        {!editOpen[idx] ? (
-                          <>
-                            {brand ? (
-                              <span className="text-gray-700">· {brand}</span>
-                            ) : (
-                              <span className="text-amber-700/90 underline underline-dotted decoration-2">
-                                · brand?
-                              </span>
-                            )}{" "}
-                            {variant ? (
-                              <span className="text-gray-700">
-                                · {variant}
-                              </span>
-                            ) : (
-                              <span className="text-amber-700/90 underline underline-dotted decoration-2">
-                                · variant?
-                              </span>
-                            )}
-                          </>
-                        ) : (
-                          <span className="text-indigo-600 underline decoration-dotted">
-                            {" "}
-                            (editing…)
+                    <div className="flex min-w-0 flex-1 flex-col gap-1">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <button
+                          className="truncate text-left"
+                          onClick={() => toggleEdit(idx)}
+                          title="Click to edit brand/variant inline"
+                        >
+                          <span className="font-medium text-gray-900">
+                            {qty}
+                            {unit} {base}
+                          </span>{" "}
+                          {!editOpen[idx] ? (
+                            <>
+                              {brand ? (
+                                <span className="text-gray-700">
+                                  · {brand}
+                                </span>
+                              ) : (
+                                <span className="text-amber-700/90 underline underline-dotted decoration-2">
+                                  · brand?
+                                </span>
+                              )}{" "}
+                              {variant ? (
+                                <span className="text-gray-700">
+                                  · {variant}
+                                </span>
+                              ) : (
+                                <span className="text-amber-700/90 underline underline-dotted decoration-2">
+                                  · variant?
+                                </span>
+                              )}
+                            </>
+                          ) : (
+                            <span className="text-indigo-600 underline decoration-dotted">
+                              {" "}
+                              (editing…)
+                            </span>
+                          )}
+                        </button>
+
+                        {ambiguous && !editOpen[idx] && (
+                          <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-[2px] text-[11px] text-amber-800">
+                            <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                            Needs details
                           </span>
                         )}
-                      </button>
+                      </div>
 
-                      {ambiguous && !editOpen[idx] && (
-                        <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-[2px] text-[11px] text-amber-800">
-                          <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
-                          Needs details
-                        </span>
+                      {/* Price row */}
+                      {price != null && (
+                        <div className="text-[11px] text-gray-600">
+                          {CURRENCY} {price.toFixed(2)}{" "}
+                          {i.unit ? `per ${i.unit}` : "per unit"}
+                          {lineTotal != null && (
+                            <>
+                              {" "}
+                              · Line:{" "}
+                              <span className="font-medium text-gray-800">
+                                {CURRENCY} {lineTotal.toFixed(2)}
+                              </span>
+                            </>
+                          )}
+                        </div>
                       )}
 
+                      {/* Inline edit inputs */}
                       {editOpen[idx] && (
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-gray-600 text-[12px]">
+                          <span className="text-[12px] text-gray-600">
                             brand:
                           </span>
                           <input
@@ -626,7 +912,7 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
                               }))
                             }
                           />
-                          <span className="text-gray-600 text-[12px]">
+                          <span className="text-[12px] text-gray-600">
                             variant:
                           </span>
                           <input
@@ -641,7 +927,7 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
                             }
                           />
                           <button
-                            className="text-[11px] rounded border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-emerald-700 hover:bg-emerald-100"
+                            className="rounded border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700 hover:bg-emerald-100"
                             onClick={() => saveInline(idx)}
                             disabled={saveBusy === idx}
                             title="Save this line and teach AI"
@@ -649,7 +935,7 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
                             {saveBusy === idx ? "Saving…" : "✅ Save"}
                           </button>
                           <button
-                            className="text-[11px] rounded border px-2 py-0.5 hover:bg-gray-50"
+                            className="rounded border px-2 py-0.5 text-[11px] hover:bg-gray-50"
                             onClick={() => {
                               setEditOpen((s) => ({ ...s, [idx]: false }));
                               setBrandEdits((s) => ({ ...s, [idx]: "" }));
@@ -667,52 +953,61 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
                     </div>
 
                     {/* RIGHT: per-line actions */}
-                    <div className="flex items-center gap-1">
+                    <div className="ml-2 flex items-center gap-1">
                       <button
-                        className="ml-2 text-[11px] rounded border border-red-200 bg-red-50 px-2 py-0.5 text-red-700 hover:bg-red-100"
+                        className="rounded border border-red-200 bg-red-50 px-2 py-0.5 text-[11px] text-red-700 hover:bg-red-100"
                         onClick={() => deleteItem(idx)}
                         title="Remove this item from the order"
                       >
                         🗑 Delete item
                       </button>
 
-                      {(ambiguous || editOpen[idx]) &&
-                       o.source_phone &&
-                       !isWaba && (
+                      {/* Split to New Order (per line) */}
+                      <button
+                        className="rounded border border-blue-300 bg-blue-50 px-2 py-0.5 text-[11px] text-blue-800 hover:bg-blue-100 disabled:opacity-50"
+                        onClick={() => splitOne(idx)}
+                        disabled={splitBusy === idx}
+                        title="Split this line into a NEW order"
+                      >
+                        {splitBusy === idx ? "…" : "↗︎ Split"}
+                      </button>
+
+                      {/* Clarify link: available for local + WABA */}
+                      {/* {(ambiguous || editOpen[idx]) && (
                         <button
-                          className="text-[11px] rounded border px-2 py-0.5 hover:bg-gray-50"
-                          onClick={async () => {
-                            try {
-                              setClarLoading(idx);
-                              const url = await getClarifyLink(o.id, idx);
-                              await navigator.clipboard.writeText(url);
-                              alert(
-                                "Clarify link copied. Paste it in WhatsApp."
-                              );
-                            } catch (e) {
-                              console.error(e);
-                              alert("Failed to create link");
-                            } finally {
-                              setClarLoading(null);
-                            }
-                          }}
-                          title="Copy a clarify link for this item"
+                          className="rounded border px-2 py-0.5 text-[11px] hover:bg-gray-50"
+                          onClick={() => handleClarifyClick(idx)}
+                          disabled={clarLoading === idx}
+                          title="Clarify this item with the customer"
                         >
                           {clarLoading === idx ? "…" : "🔗 Clarify"}
                         </button>
-                      )}
+                      )} */}
 
                       {/* WA deep link only for LOCAL mode */}
                       {(ambiguous || editOpen[idx]) &&
                         o.source_phone &&
                         !isWaba && (
                           <button
-                            className="text-[11px] rounded border px-2 py-0.5 hover:bg-gray-50"
+                            className="rounded border px-2 py-0.5 text-[11px] hover:bg-gray-50"
                             onClick={() => sendPerItemWA(idx)}
                             disabled={waLoading === idx}
                             title="Open WhatsApp with a prefilled message for this item"
                           >
                             {waLoading === idx ? "…" : "💬 WhatsApp"}
+                          </button>
+                        )}
+
+                      {/* WABA-only: quick price reply for this line */}
+                      {isWaba &&
+                        canSendWaba &&
+                        typeof i.price_per_unit === "number" && (
+                          <button
+                            className="rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-800 hover:bg-emerald-100"
+                            onClick={() => sendPriceForLineWaba(idx)}
+                            title="Send price for just this item on WhatsApp"
+                          >
+                            💸 Price
                           </button>
                         )}
                     </div>
@@ -722,11 +1017,19 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
             </div>
           ) : (
             <div className="rounded-lg border border-dashed border-gray-300 bg-white px-2 py-1.5 text-gray-500">
-              {o.raw_text || (
-                <span className="text-gray-400">No items</span>
-              )}
+              {o.raw_text || <span className="text-gray-400">No items</span>}
             </div>
           )}
+        </div>
+
+        {/* Order total (always show; will be 0.00 if no prices) */}
+        <div className="mt-2 flex items-center justify-end border-t border-dashed border-gray-200 pt-2 text-[12px] text-gray-900">
+          <span className="mr-2 text-gray-500">
+            {hasAnyPrice ? "Total:" : "Total (no prices set):"}
+          </span>
+          <span className="font-semibold">
+            {CURRENCY} {subtotal.toFixed(2)}
+          </span>
         </div>
 
         {/* raw/audio toggles */}
@@ -795,7 +1098,7 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
                       key={idx}
                       className="rounded-xl border border-gray-200 p-2"
                     >
-                      <div className="grid gap-2 grid-cols-2 md:grid-cols-6">
+                      <div className="grid grid-cols-2 gap-2 md:grid-cols-6">
                         <div className="col-span-2">
                           <label className="block text-[11px] text-gray-500">
                             Name / Canonical
@@ -869,7 +1172,7 @@ export default function OrderCard({ o, onChange, modeHint }: Props) {
                         </div>
                       </div>
 
-                      <div className="mt-2 grid gap-2 grid-cols-1 md:grid-cols-6">
+                      <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-6">
                         <div className="md:col-span-5">
                           <label className="block text-[11px] text-gray-500">
                             Notes (optional)

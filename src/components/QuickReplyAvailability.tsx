@@ -6,6 +6,11 @@ type Props = {
   customerName?: string | null;
   defaultItem?: string | null;
   className?: string;
+  /**
+   * Optional backend sender (WABA). If provided, we call this instead of
+   * opening WhatsApp Web.
+   */
+  onSend?: (text: string) => void | Promise<void>;
 };
 
 function buildWAWebLink(phoneLike: string, text: string) {
@@ -23,6 +28,7 @@ const QuickReplyAvailability: React.FC<Props> = ({
   customerName,
   defaultItem,
   className,
+  onSend,
 }) => {
   const [note, setNote] = useState(""); // e.g., "Yes, available" or "Back in stock tomorrow"
   const hasPhone = !!(phone && String(phone).trim());
@@ -39,7 +45,16 @@ const QuickReplyAvailability: React.FC<Props> = ({
     return `${line1}\n${line2}\n${line3}`;
   }, [note, firstName, itemLabel]);
 
-  const openWA = () => {
+  const handleSend = async () => {
+    if (onSend) {
+      try {
+        await onSend(preview);
+      } catch (e) {
+        console.error(e);
+        alert("Could not send reply. Please try again.");
+      }
+      return;
+    }
     if (!hasPhone) return;
     try {
       const link = buildWAWebLink(String(phone), preview);
@@ -51,17 +66,26 @@ const QuickReplyAvailability: React.FC<Props> = ({
   };
 
   return (
-    <div className={["rounded-xl border border-green-200 bg-green-50 p-3", className || ""].join(" ")}>
+    <div
+      className={[
+        "rounded-xl border border-green-200 bg-green-50 p-3",
+        className || "",
+      ].join(" ")}
+    >
       <div className="mb-2 flex items-center justify-between">
-        <div className="text-[12px] font-semibold text-green-900">Quick Reply · Availability</div>
-        {!hasPhone && (
+        <div className="text-[12px] font-semibold text-green-900">
+          Quick Reply · Availability
+        </div>
+        {!onSend && !hasPhone && (
           <span className="text-[11px] text-green-700">Phone missing</span>
         )}
       </div>
 
       <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
         <div className="md:col-span-2">
-          <label className="block text-[11px] text-green-800 mb-0.5">Item</label>
+          <label className="mb-0.5 block text-[11px] text-green-800">
+            Item
+          </label>
           <input
             className="w-full rounded-md border border-green-200 bg-white px-2 py-1 text-sm"
             value={itemLabel}
@@ -70,7 +94,9 @@ const QuickReplyAvailability: React.FC<Props> = ({
         </div>
 
         <div className="md:col-span-3">
-          <label className="block text-[11px] text-green-800 mb-0.5">Availability / Note</label>
+          <label className="mb-0.5 block text-[11px] text-green-800">
+            Availability / Note
+          </label>
           <input
             className="w-full rounded-md border border-green-200 bg-white px-2 py-1 text-sm"
             placeholder='e.g., "Yes, available" or "Restocking tomorrow"'
@@ -80,7 +106,7 @@ const QuickReplyAvailability: React.FC<Props> = ({
         </div>
       </div>
 
-      <div className="mt-2 rounded-md border border-green-200 bg-white p-2 text-[12px] text-green-900 whitespace-pre-wrap">
+      <div className="mt-2 whitespace-pre-wrap rounded-md border border-green-200 bg-white p-2 text-[12px] text-green-900">
         {preview}
       </div>
 
@@ -88,14 +114,17 @@ const QuickReplyAvailability: React.FC<Props> = ({
         <button
           className="rounded-md border border-green-300 bg-white px-2 py-1 text-[12px] text-green-800 hover:bg-green-100"
           onClick={() =>
-            navigator.clipboard.writeText(preview).then(() => alert("Copied to clipboard"))
+            navigator.clipboard
+              .writeText(preview)
+              .then(() => alert("Copied to clipboard"))
+              .catch(() => alert("Could not copy"))
           }
         >
           Copy text
         </button>
         <button
-          onClick={openWA}
-          disabled={!hasPhone}
+          onClick={handleSend}
+          disabled={!onSend && !hasPhone}
           className="rounded-md border border-green-300 bg-green-600 px-3 py-1 text-[12px] font-semibold text-white hover:bg-green-700 disabled:opacity-50"
         >
           💬 Send in WhatsApp

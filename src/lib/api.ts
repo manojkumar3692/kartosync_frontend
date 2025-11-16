@@ -8,8 +8,65 @@ export const API_BASE = import.meta.env.VITE_API_BASE || "";
 const api = axios.create({ baseURL: API_BASE });
 
 // ─────────────────────────────────────────────────────────
+// Org settings (payments)
+// ─────────────────────────────────────────────────────────
+
+export type OrgSettings = {
+  id: string;
+  name: string;
+  payment_enabled: boolean;
+  payment_qr_url?: string | null;
+  payment_instructions?: string | null;
+  default_currency?: string | null;
+};
+
+export type OrgPaymentSettings = OrgSettings;
+
+// ─────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────
+// Analytics
+// ─────────────────────────────────────────────────────────
+export type AnalyticsItemRow = {
+  label: string;
+  qty: number;
+  sales: number;
+};
+
+export type AnalyticsCustomerRow = {
+  customer_key: string;
+  phone: string;
+  name: string | null;
+  orders: number;
+  sales: number;
+  last_order_at: string | null;
+};
+
+export type AnalyticsSummary = {
+  org_id: string;
+  currency: string; // e.g. "AED" or "INR"
+  range: {
+    from: string; // ISO
+    to: string;   // ISO
+  };
+  totals: {
+    total_sales: number;
+    total_orders: number;
+    paid_orders: number;
+    paid_rate: number;       // 0–1
+    avg_order_value: number; // per paid order
+  };
+  items: {
+    top_items: AnalyticsItemRow[];
+  };
+  customers: {
+    top_customers: AnalyticsCustomerRow[];
+  };
+};
+
+
 export type OrderStatus = "pending" | "shipped" | "paid";
 
 export type Item = {
@@ -69,6 +126,7 @@ export type AdminProduct = {
   dynamic_price?: boolean;
   brand?: string | null;
   is_active?: boolean;
+  price_per_unit?: number | null; 
 };
 
 export type ListProductsResponse = {
@@ -213,12 +271,21 @@ export async function listProducts(opts?: {
   if (opts?.search) params.search = opts.search;
 
   const { data } = await api.get(`/api/admin/products`, { params });
-  // Normalize a few possible shapes:
-  if (data?.items && typeof data?.total === "number") return data;
-  if (Array.isArray(data))
+
+  if (data?.items && typeof data?.total === "number") {
+    return data as ListProductsResponse;
+  }
+
+  if (Array.isArray(data)) {
     return { items: data as AdminProduct[], total: (data as any).length ?? 0 };
-  if (data?.data && Array.isArray(data.data))
-    return { items: data.data as AdminProduct[], total: data.total ?? data.data.length ?? 0 };
+  }
+
+  if (data?.data && Array.isArray(data.data)) {
+    return {
+      items: data.data as AdminProduct[],
+      total: data.total ?? data.data.length ?? 0,
+    };
+  }
 
   return { items: [], total: 0 };
 }
@@ -235,9 +302,25 @@ export async function deleteProduct(id: string) {
   return data as { ok?: boolean };
 }
 
-// Import CSV (expects backend route: POST /api/admin/products/import { csvText, mode })
-export async function importProductsCSV(csvText: string, mode: "upsert" | "insert" = "upsert") {
-  const { data } = await api.post(`/api/admin/products/import`, { csvText, mode });
+// Import CSV
+// - You can pass either a File OR a raw CSV string.
+// - Backend expects { csvText, mode } JSON body.
+export async function importProductsCSV(
+  fileOrCsvText: File | string,
+  mode: "upsert" | "insert" = "upsert"
+) {
+  let csvText: string;
+
+  if (typeof File !== "undefined" && fileOrCsvText instanceof File) {
+    csvText = await fileOrCsvText.text();
+  } else {
+    csvText = String(fileOrCsvText);
+  }
+
+  const { data } = await api.post(`/api/admin/products/import`, {
+    csvText,
+    mode,
+  });
   return data as { ok?: boolean; imported?: number; updated?: number };
 }
 
@@ -248,15 +331,116 @@ export function logout() {
   setToken(undefined);
 }
 
-export async function sendInboxMessage(orgId: string, phone: string, text: string) {
-  const { data } = await api.post(`/api/inbox/send`, { org_id: orgId, phone, text });
+export async function sendInboxMessage(
+  orgId: string,
+  phone: string,
+  text: string
+) {
+  const { data } = await api.post(`/api/inbox/send`, {
+    org_id: orgId,
+    phone,
+    text,
+  });
   return data as { ok: boolean; error?: string };
 }
 
 // Optional: fetch latest order context for a phone (for “AI reasoning”)
 export async function getLatestOrderForPhone(orgId: string, phone: string) {
-  const { data } = await api.get(`/api/inbox/latest-order`, { params: { org_id: orgId, phone } });
-  return (data?.order || null) as (Order | null);
+  const { data } = await api.get(`/api/inbox/latest-order`, {
+    params: { org_id: orgId, phone },
+  });
+  return (data?.order || null) as Order | null;
+}
+
+// ─────────────────────────────────────────────────────────
+/** Order split / merge helpers */
+// ─────────────────────────────────────────────────────────
+
+// Canonical function used by dashboard: split given line indexes to a new order
+export async function splitOrderItems(orderId: string, indexes: number[]) {
+  const payload = { item_indices: indexes };
+  const { data } = await api.post(`/api/orders/${orderId}/split`, payload);
+  return data as { ok: boolean; new_order_id?: string };
+}
+
+// Canonical merge helper: merge this order into previous open order
+export async function mergeWithPrevious(orderId: string) {
+  const { data } = await api.post(`/api/orders/${orderId}/merge-previous`, {});
+  return data as { ok: boolean; merged_into?: string };
+}
+
+// Legacy-style wrappers (if some code still calls these)
+export async function splitOrder(
+  orderId: string,
+  _orgId: string,
+  itemIndices?: number[]
+) {
+  return splitOrderItems(orderId, itemIndices || []);
+}
+
+export async function mergeOrderWithPrevious(orderId: string, _orgId: string) {
+  return mergeWithPrevious(orderId);
+}
+
+
+// ─────────────────────────────────────────────────────────
+/** Analytics */
+// ─────────────────────────────────────────────────────────
+export async function getAnalyticsSummary(opts?: {
+  from?: string;
+  to?: string;
+}): Promise<AnalyticsSummary> {
+  const params: Record<string, string> = {};
+  if (opts?.from) params.from = opts.from;
+  if (opts?.to) params.to = opts.to;
+
+  const { data } = await api.get(`/api/analytics/summary`, { params });
+  return data as AnalyticsSummary;
+}
+
+export async function sendPaymentQR(orgId: string, orderId: string) {
+  const { data } = await api.post(`/api/payments/send-qr`, {
+    org_id: orgId,
+    order_id: orderId,
+  });
+  return data;
+}
+
+export async function getOrgSettings() {
+  // backend will read org_id from auth token (same as /api/org/me)
+  const { data } = await api.get(`/api/org/settings`);
+  return data as OrgSettings;
+}
+
+export async function updateOrgSettings(payload: {
+  payment_enabled?: boolean;
+  payment_qr_url?: string | null;
+  payment_instructions?: string | null;
+  default_currency?: string | null;
+}) {
+  const { data } = await api.post(`/api/org/settings`, payload);
+  return data as OrgSettings;
+}
+
+// Upload QR image and get back a public URL
+export async function uploadPaymentQr(file: File) {
+  const form = new FormData();
+  form.append("file", file);
+
+  const { data } = await api.post(`/api/org/payment-qr`, form, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+
+  return data as { url: string };
+}
+
+
+// ✅ Wrapper to update payment-related settings via JSON
+export async function updatePaymentQR(
+  payload: Partial<OrgPaymentSettings>
+): Promise<OrgPaymentSettings> {
+  const { data } = await api.post("/api/org/settings", payload);
+  return data as OrgPaymentSettings;
 }
 
 export default api;
