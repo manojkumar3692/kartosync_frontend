@@ -2,7 +2,7 @@
 // Brand/variant inline edit + per-line clarify + Inquiry quick replies + Delete order
 // + Operator overrides: Split to New Order (per line) & Merge with Previous (card-level)
 // + Price per line, order total & "Send summary" to WhatsApp / WABA
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   aiFixOrder,
   getClarifyLink,
@@ -11,6 +11,7 @@ import {
   splitOrderItems,
   mergeWithPrevious,
   sendInboxMessage,
+  listProducts, // ⬅️ NEW: use the existing admin catalog API
 } from "../lib/api";
 import { timeAgo, useTicker } from "../lib/time";
 import { OrderReasonChips } from "./OrderReasonChips";
@@ -41,7 +42,7 @@ type Item = {
 type Order = {
   id: string;
   created_at: string;
-  status: "pending" | "shipped" | "paid";
+  status: "pending" | "shipped" | "paid" | "cancelled";
   customer_name?: string | null;
   source_phone?: string | null;
   raw_text?: string | null;
@@ -60,6 +61,16 @@ type Props = {
   orgId?: string;
 };
 
+// Simple view of products from admin catalog
+type CatalogProduct = {
+  canonical?: string | null;
+  name?: string | null;   // allow backend to send name
+  label?: string | null;  // or label
+  variant?: string | null;
+  dynamic_price?: boolean | null;
+  price_per_unit?: number | null;
+};
+
 // ─────────────────────────────────────────────────────
 
 const StatusDot: React.FC<{ status: Order["status"] }> = ({ status }) => {
@@ -68,7 +79,9 @@ const StatusDot: React.FC<{ status: Order["status"] }> = ({ status }) => {
       ? "bg-emerald-500"
       : status === "shipped"
       ? "bg-blue-500"
-      : "bg-amber-500";
+      : status === "cancelled"
+      ? "bg-rose-500"
+      : "bg-amber-500"; // pending / others
   return <span className={`inline-block h-2 w-2 rounded-full ${color}`} />;
 };
 
@@ -247,6 +260,130 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
     }))
   );
 
+  // ─────────────────────────────────────────────
+  // NEW: catalog cache for auto-pricing by variant
+  // ─────────────────────────────────────────────
+  const [catalog, setCatalog] = useState<CatalogProduct[]>([]);
+
+  useEffect(() => {
+    // load admin catalog once when card mounts
+    (async () => {
+      try {
+        const res: any = await listProducts();
+        const items =
+          (res && Array.isArray(res.items) && res.items) ||
+          (Array.isArray(res) ? res : []);
+        setCatalog(items);
+      } catch (e) {
+        console.error("[OrderCard] failed to load catalog", e);
+      }
+    })();
+  }, []);
+
+  function normKey(s?: string | null) {
+    return (s || "").trim().toLowerCase();
+  }
+  
+  function getBaseName(p: CatalogProduct): string {
+    return (
+      normKey(p.canonical) ||
+      normKey(p.name as any) ||
+      normKey(p.label as any)
+    );
+  }
+
+  function findMatchingProduct(
+    canonical?: string | null,
+    variant?: string | null
+  ): CatalogProduct | undefined {
+    if (!catalog.length) return undefined;
+  
+    const canonKey = normKey(canonical);
+    const varKey = normKey(variant);
+  
+    if (!canonKey && !varKey) return undefined;
+  
+    // 1) strict canonical match (same as before, but using base name)
+    let candidates = catalog.filter((p) => getBaseName(p) === canonKey);
+  
+    // 2) if nothing, try a "contains" match:
+    //    e.g. order "onion" vs catalog "onion small" or "onion - small"
+    if (!candidates.length && canonKey) {
+      candidates = catalog.filter((p) => {
+        const base = getBaseName(p);
+        return (
+          base &&
+          (base.includes(canonKey) || canonKey.includes(base))
+        );
+      });
+    }
+  
+    if (!candidates.length) return undefined;
+  
+    // 3) If we know the variant, try to match it within candidates
+    if (varKey) {
+      const exactVar = candidates.find(
+        (p) => normKey(p.variant) === varKey
+      );
+      if (exactVar) return exactVar;
+    }
+  
+    // 4) Fallback: just take the first candidate
+    return candidates[0];
+  }
+
+    // ─────────────────────────────────────────────
+  // Auto-enrich items with price from catalog for display
+  // (does NOT write back to DB; just used for UI & WhatsApp messages)
+  // ─────────────────────────────────────────────
+  const enrichedItems: Item[] = useMemo(() => {
+    const src = o.items || [];
+    if (!src.length || !catalog.length) return src;
+
+    return src.map((it) => {
+      const qty =
+        typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
+
+      // start from existing price fields
+      let price =
+        typeof it.price_per_unit === "number" &&
+        !Number.isNaN(it.price_per_unit)
+          ? it.price_per_unit
+          : null;
+      let lineTotal =
+        typeof it.line_total === "number" && !Number.isNaN(it.line_total)
+          ? it.line_total
+          : null;
+
+      // if no price yet → try catalog (canonical + variant)
+      if (price == null) {
+        const product = findMatchingProduct(
+          it.canonical || it.name || "",
+          it.variant || null
+        );
+        if (
+          product &&
+          typeof product.price_per_unit === "number" &&
+          !Number.isNaN(product.price_per_unit)
+        ) {
+          price = product.price_per_unit;
+        }
+      }
+
+      // if we now have a price but no line_total → compute it
+      if (lineTotal == null && price != null) {
+        lineTotal = qty * price;
+      }
+
+      // return an item with enriched price fields
+      return {
+        ...it,
+        price_per_unit: price,
+        line_total: lineTotal,
+      };
+    });
+  }, [o.items, catalog]);
+
   function openFix() {
     setFixItems(
       (o.items || []).map((i) => ({
@@ -296,27 +433,43 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
 
   async function submitFix() {
     const cleaned = fixItems
-      .map((it) => ({
-        qty:
-          it.qty === null || Number.isNaN(it.qty as any)
-            ? null
-            : Number(it.qty),
-        unit: (it.unit || "")?.trim() || null,
-        canonical: (it.canonical || "")?.trim() || null,
-        name: (it.name || "")?.trim() || undefined,
-        brand: (it.brand || "")?.trim() || null,
-        variant: (it.variant || "")?.trim() || null,
-        notes: (it.notes || "")?.trim() || null,
-         // ✅ keep pricing fields so DB can store them
-      price_per_unit:
-      it.price_per_unit == null || Number.isNaN(it.price_per_unit as any)
-        ? null
-        : Number(it.price_per_unit),
-    line_total:
-      it.line_total == null || Number.isNaN(it.line_total as any)
-        ? null
-        : Number(it.line_total),
-      }))
+      .map((it) => {
+        const base: any = {
+          qty:
+            it.qty === null || Number.isNaN(it.qty as any)
+              ? null
+              : Number(it.qty),
+          unit: (it.unit || "")?.trim() || null,
+          canonical: (it.canonical || "")?.trim() || null,
+          name: (it.name || "")?.trim() || undefined,
+          brand: (it.brand || "")?.trim() || null,
+          variant: (it.variant || "")?.trim() || null,
+          notes: (it.notes || "")?.trim() || null,
+          // keep pricing fields so DB can store them
+          price_per_unit:
+            it.price_per_unit == null ||
+            Number.isNaN(it.price_per_unit as any)
+              ? null
+              : Number(it.price_per_unit),
+          line_total:
+            it.line_total == null || Number.isNaN(it.line_total as any)
+              ? null
+              : Number(it.line_total),
+        };
+
+        // 🔁 NEW: auto-price from catalog when we have canonical + variant
+        const product = findMatchingProduct(base.canonical, base.variant);
+if (product && product.price_per_unit != null) {
+  base.price_per_unit = Number(product.price_per_unit);
+  if (base.qty != null && !Number.isNaN(base.qty)) {
+    base.line_total = base.qty * Number(product.price_per_unit);
+  } else {
+    base.line_total = Number(product.price_per_unit);
+  }
+}
+
+        return base;
+      })
       .filter((it) => (it.canonical || it.name)?.length);
     if (!cleaned.length) return;
     await aiFixOrder(o.id, {
@@ -365,6 +518,7 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
       setSaveBusy(idx);
       const newItems: Item[] = o.items.map((it, i) => {
         if (i !== idx) return it;
+
         const brand =
           (editOpen[idx]
             ? (brandEdits[idx]?.trim() || null)
@@ -373,7 +527,8 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
           (editOpen[idx]
             ? (variantEdits[idx]?.trim() || null)
             : it.variant ?? null) || null;
-        return {
+
+        let updated: Item = {
           qty: typeof it.qty === "number" ? it.qty : null,
           unit: it.unit ?? null,
           canonical: (it.canonical || it.name || "") || "",
@@ -385,6 +540,23 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
           price_per_unit: it.price_per_unit ?? null,
           line_total: it.line_total ?? null,
         };
+
+        // 🔁 NEW: auto-price when brand/variant is updated inline
+        const product = findMatchingProduct(
+          updated.canonical,
+          updated.variant
+        );
+        if (product && product.price_per_unit != null) {
+          const p = Number(product.price_per_unit);
+          updated.price_per_unit = p;
+          const q =
+            updated.qty != null && !Number.isNaN(updated.qty)
+              ? updated.qty
+              : 1;
+          updated.line_total = q * p;
+        }
+
+        return updated;
       });
 
       await aiFixOrder(o.id, {
@@ -399,15 +571,15 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
           brand: (x.brand || "")?.trim() || null,
           variant: (x.variant || "")?.trim() || null,
           notes: (x.notes || "")?.trim() || null,
-          // ✅ DON'T DROP THEM HERE
-    price_per_unit:
-    x.price_per_unit == null || Number.isNaN(x.price_per_unit as any)
-      ? null
-      : Number(x.price_per_unit),
-  line_total:
-    x.line_total == null || Number.isNaN(x.line_total as any)
-      ? null
-      : Number(x.line_total),
+          price_per_unit:
+            x.price_per_unit == null ||
+            Number.isNaN(x.price_per_unit as any)
+              ? null
+              : Number(x.price_per_unit),
+          line_total:
+            x.line_total == null || Number.isNaN(x.line_total as any)
+              ? null
+              : Number(x.line_total),
         })),
         reason: `inline_fix:item_${idx}`,
       });
@@ -498,7 +670,7 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
   // WABA-only: per-line price quick reply
   const sendPriceForLineWaba = async (idx: number) => {
     if (!canSendWaba) return;
-    const it = (o.items || [])[idx];
+    const it = enrichedItems[idx];
     if (!it) return;
     const qty =
       typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
@@ -571,22 +743,39 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
   }, [o.items]);
 
 // Price subtotal: use price_per_unit if present, otherwise fall back to line_total
+  // Price subtotal: use enrichedItems (which already pulled from catalog)
+// Price subtotal: use enrichedItems (catalog-enriched)
+// Prefer price_per_unit; if missing, fall back to line_total
 const { subtotal, hasAnyPrice } = useMemo(() => {
   let sum = 0;
   let anyPrice = false;
-  (o.items || []).forEach((it) => {
-    const qty = typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
+
+  enrichedItems.forEach((it) => {
+    const qty =
+      typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
+
     const price =
-      typeof it.price_per_unit === "number" && !Number.isNaN(it.price_per_unit)
+      typeof it.price_per_unit === "number" &&
+      !Number.isNaN(it.price_per_unit)
         ? it.price_per_unit
         : null;
+
+    const lineTotal =
+      typeof it.line_total === "number" && !Number.isNaN(it.line_total)
+        ? it.line_total
+        : null;
+
     if (price != null) {
       anyPrice = true;
       sum += qty * price;
+    } else if (lineTotal != null) {
+      anyPrice = true;
+      sum += lineTotal;
     }
   });
+
   return { subtotal: sum, hasAnyPrice: anyPrice };
-}, [o.items]);
+}, [enrichedItems]);
 
 
 
@@ -633,7 +822,10 @@ const { subtotal, hasAnyPrice } = useMemo(() => {
   // Send summary / bill
   const sendSummaryToCustomer = async () => {
     if (!o.source_phone) return;
-    const text = buildOrderSummaryText(o, subtotal);
+    const text = buildOrderSummaryText(
+      { ...o, items: enrichedItems },
+      subtotal
+    );
 
     if (canSendWaba) {
       await sendWabaText(text);
@@ -799,9 +991,9 @@ const { subtotal, hasAnyPrice } = useMemo(() => {
 
         {/* items */}
         <div className="mt-2 text-[13px] text-gray-700">
-          {(o.items || []).length ? (
+          {enrichedItems.length ? (
             <div className="flex flex-col gap-1.5">
-              {(o.items || []).map((i, idx) => {
+              {enrichedItems.map((i, idx) => {
                 const qty = i.qty ?? 1;
                 const unit = i.unit ? ` ${i.unit}` : "";
                 const base = i.canonical || i.name || "item";

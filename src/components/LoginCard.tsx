@@ -48,7 +48,7 @@ export default function LoginCard({
               </div>
               <div className="flex flex-col leading-tight">
                 <span className="text-sm font-semibold text-slate-900">
-                  Karto Orders
+                  Kart Order
                 </span>
                 <span className="text-[11px] text-slate-500">
                   AI + WhatsApp Cloud API for local stores
@@ -65,7 +65,7 @@ export default function LoginCard({
               Sign in to your workspace
             </h2>
             <p className="mt-1 text-sm text-slate-600">
-              Use the phone & password configured on your Karto Orders account.
+              Use the phone & password configured on your Kart Order account.
             </p>
 
             <ul className="mt-4 space-y-1.5 text-xs text-slate-500">
@@ -152,7 +152,7 @@ export default function LoginCard({
 
         {/* footer */}
         <div className="border-t border-slate-200 bg-slate-50 px-6 py-2 text-center text-[11px] text-slate-400">
-          © {new Date().getFullYear()} Karto Orders · Made for WhatsApp-first
+          © {new Date().getFullYear()} Kart Order · Made for WhatsApp-first
           stores
         </div>
       </div>

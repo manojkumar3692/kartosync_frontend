@@ -67,7 +67,7 @@ export type AnalyticsSummary = {
 };
 
 
-export type OrderStatus = "pending" | "shipped" | "paid";
+export type OrderStatus = "pending" | "shipped" | "paid" | "cancelled";
 
 export type Item = {
   qty: number | null;
@@ -441,6 +441,12 @@ export async function updatePaymentQR(
 ): Promise<OrgPaymentSettings> {
   const { data } = await api.post("/api/org/settings", payload);
   return data as OrgPaymentSettings;
+}
+
+
+export async function listPastOrders() {
+  const res = await api.get("/api/orders/past?limit=200");
+  return res.data;
 }
 
 export default api;

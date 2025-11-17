@@ -7,7 +7,7 @@ import api, {
   logout as apiLogout,
   me as apiMe,
   sendInboxMessage,
-  sendPaymentQR
+  sendPaymentQR,
 } from "../lib/api";
 
 import OrderCard from "./OrderCard";
@@ -37,6 +37,12 @@ export default function Dashboard() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [loadingOrders, setLoadingOrders] = useState(false);
 
+    // Filter for live vs past orders (non-WABA view)
+   // "live" = pending + shipped, "past" = paid + cancelled, "all" = everything
+   const [orderFilter, setOrderFilter] = useState<"live" | "past" | "all">(
+    "live"
+  );
+
   // WABA inbox state
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [loadingConvos, setLoadingConvos] = useState(false);
@@ -57,12 +63,16 @@ export default function Dashboard() {
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
 
   // NEW: Auto-reply toggle state (org-level)
-  const [autoReplyEnabled, setAutoReplyEnabled] = useState<boolean | null>(null);
+  const [autoReplyEnabled, setAutoReplyEnabled] = useState<boolean | null>(
+    null
+  );
   const [autoReplySaving, setAutoReplySaving] = useState(false);
 
   // NEW: Auto-reply per customer (WABA only)
   const [autoReplyMap, setAutoReplyMap] = useState<Record<string, boolean>>({});
   const [autoReplyBusy, setAutoReplyBusy] = useState(false);
+
+  
 
   // ───────────────── org + auth ─────────────────
   useEffect(() => {
@@ -109,28 +119,28 @@ export default function Dashboard() {
   }, [orgId]);
 
   // NEW: Per-customer auto-reply status loader (from backend)
-useEffect(() => {
-  if (!isWaba || !orgId || !selected?.customer_phone) return;
+  useEffect(() => {
+    if (!isWaba || !orgId || !selected?.customer_phone) return;
 
-  const phoneKey = selected.customer_phone.replace(/[^\d]/g, "");
+    const phoneKey = selected.customer_phone.replace(/[^\d]/g, "");
 
-  (async () => {
-    try {
-      const { data } = await api.get("/api/inbox/auto_reply", {
-        params: { org_id: orgId, phone: phoneKey },
-      });
+    (async () => {
+      try {
+        const { data } = await api.get("/api/inbox/auto_reply", {
+          params: { org_id: orgId, phone: phoneKey },
+        });
 
-      if (typeof data?.enabled === "boolean") {
-        setAutoReplyMap((prev) => ({
-          ...prev,
-          [phoneKey]: data.enabled,
-        }));
+        if (typeof data?.enabled === "boolean") {
+          setAutoReplyMap((prev) => ({
+            ...prev,
+            [phoneKey]: data.enabled,
+          }));
+        }
+      } catch (e) {
+        console.error("[Dashboard] get auto_reply failed", e);
       }
-    } catch (e) {
-      console.error("[Dashboard] get auto_reply failed", e);
-    }
-  })();
-}, [isWaba, orgId, selected?.customer_phone]);
+    })();
+  }, [isWaba, orgId, selected?.customer_phone]);
 
   const refreshOrders = async () => {
     if (!orgId) return;
@@ -177,12 +187,11 @@ useEffect(() => {
       const { data } = await api.get("/api/inbox/conversations", {
         params: { org_id: orgId },
       });
-      const arr: Conversation[] =
-        Array.isArray(data)
-          ? (data as Conversation[])
-          : Array.isArray((data as any)?.conversations)
-          ? ((data as any).conversations as Conversation[])
-          : [];
+      const arr: Conversation[] = Array.isArray(data)
+        ? (data as Conversation[])
+        : Array.isArray((data as any)?.conversations)
+        ? ((data as any).conversations as Conversation[])
+        : [];
 
       setConversations(arr);
 
@@ -193,6 +202,10 @@ useEffect(() => {
         setSelectedOrderId(null);
         await loadMessages(first);
       }
+
+      // 🔹 NEW: keep center order card in sync with inbox polling
+      await refreshOrders();   // <—— ADD THIS LINE
+
     } catch (e) {
       console.error("[Inbox] conversations failed", e);
       setConversations([]);
@@ -222,30 +235,58 @@ useEffect(() => {
       .filter((o) => normalizePhone(o.source_phone) === selPhone)
       .sort(
         (a, b) =>
-          new Date(b.created_at).getTime() -
-          new Date(a.created_at).getTime()
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
       );
   }, [isWaba, selected, orders]);
 
-  const activeOrders: Order[] = useMemo(
-    () => customerOrders.filter((o) => o.status !== "paid"),
+   // For WABA: live vs past orders *per customer*
+   const liveCustomerOrders: Order[] = useMemo(
+    () =>
+      customerOrders.filter(
+        (o) => o.status === "pending" || o.status === "shipped"
+      ),
     [customerOrders]
   );
+
+  const pastCustomerOrders: Order[] = useMemo(
+    () =>
+      customerOrders.filter(
+        (o) => o.status === "paid" || o.status === "cancelled"
+      ),
+    [customerOrders]
+  );
+
+  // Active = same as "live" for merge button etc.
+  const activeOrders: Order[] = liveCustomerOrders;
+
+  // What to show in WABA order history / chips based on filter
+  const visibleCustomerOrders: Order[] = useMemo(() => {
+    if (orderFilter === "live") return liveCustomerOrders;
+    if (orderFilter === "past") return pastCustomerOrders;
+    return customerOrders;
+  }, [orderFilter, liveCustomerOrders, pastCustomerOrders, customerOrders]);
 
   // Reset selected order when switching conversations
   useEffect(() => {
     setSelectedOrderId(null);
   }, [selected?.customer_phone]);
 
-  // For WABA: main active order for the center card
+   // For WABA: main active order for the center card
+  // Only treat pending + shipped as "active".
   const activeOrder: Order | null = useMemo(() => {
     if (!customerOrders.length) return null;
+
+    // If the user manually picked an order chip, respect that.
     if (selectedOrderId) {
       const found = customerOrders.find((o) => o.id === selectedOrderId);
       if (found) return found;
     }
-    const open = customerOrders.filter((o) => o.status !== "paid");
-    return open[0] || customerOrders[0] || null;
+
+    // Otherwise, auto-pick the first *live* order only
+    const open = customerOrders.filter(
+      (o) => o.status === "pending" || o.status === "shipped"
+    );
+    return open[0] || null; // 👈 no fallback to a paid/cancelled order
   }, [customerOrders, selectedOrderId]);
 
   // NEW: “customer may need help” heuristic
@@ -334,22 +375,43 @@ useEffect(() => {
 
   // Merge the *current* active order into the previous open order (backend: /:id/merge-previous)
   const handleMergeActiveOrders = async () => {
-    if (activeOrders.length < 2) return;
-    if (!activeOrder) return;
+    // 🔹 Only merge PENDING orders, ignore shipped/paid/cancelled
+    const pendingOrders = activeOrders.filter(
+      (o) => o.status === "pending"
+    );
+
+    if (pendingOrders.length < 2) {
+      alert("Need at least 2 pending orders to merge.");
+      return;
+    }
+    if (!customerOrders.length) return;
+
+    // Oldest → newest among ONLY pending orders
+    const sorted = [...pendingOrders].sort(
+      (a, b) =>
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+    );
+
+    const base = sorted[0]; // this pending order will survive
 
     const ok = window.confirm(
-      `Merge this order (#${activeOrder.id.slice(
+      `Merge all ${pendingOrders.length} pending orders into one order (#${base.id.slice(
         -5
-      )}) into the previous open order for this customer?`
+      )}) for this customer?`
     );
     if (!ok) return;
 
     try {
-      await api.post(`/api/orders/${activeOrder.id}/merge-previous`, {});
+      // From newest → oldest, merge each into its previous open order
+      for (let i = sorted.length - 1; i >= 1; i--) {
+        const o = sorted[i];
+        await api.post(`/api/orders/${o.id}/merge-previous`, {});
+      }
+
       await refreshOrders();
     } catch (e) {
       console.error("[Dashboard] merge-previous failed", e);
-      alert("Could not merge orders. Please try again.");
+      alert("Could not merge pending orders. Please try again.");
     }
   };
 
@@ -382,10 +444,9 @@ useEffect(() => {
   };
 
   // 🔹 Derived per-customer value using map + org fallback
-  const phoneKey =
-    selected?.customer_phone
-      ? selected.customer_phone.replace(/[^\d]/g, "")
-      : "";
+  const phoneKey = selected?.customer_phone
+    ? selected.customer_phone.replace(/[^\d]/g, "")
+    : "";
 
   const customerAutoReply =
     phoneKey && phoneKey in autoReplyMap
@@ -398,31 +459,94 @@ useEffect(() => {
   console.log("ORG:", org);
   console.log("ORG IN DASHBOARD BUTTON:", org);
 
-  // ───────────────── NON-WABA (local_bridge etc.) UI ─────────────────
-  if (!isWaba && org && !orgError) {
+   // ───────────────── NON-WABA (local_bridge etc.) UI ─────────────────
+   if (!isWaba && org && !orgError) {
+    // derive live vs past lists for this org
+    const liveOrders = orders.filter(
+      (o) => o.status === "pending" || o.status === "shipped"
+    );
+    const pastOrders = orders.filter(
+      (o) => o.status === "paid" || o.status === "cancelled"
+    );
+    const visibleOrders =
+      orderFilter === "live"
+        ? liveOrders
+        : orderFilter === "past"
+        ? pastOrders
+        : orders;
+
     return (
       <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
         <Topbar authed={true} onLogout={handleLogout} />
-        <div className="px-6 pt-4 text-xs text-slate-500">
-          Logged in as <span className="font-semibold">{org.name}</span>{" "}
-          {org.phone && <span>({org.phone})</span>} &mdash; mode:{" "}
-          <span className="font-semibold">
-            {org.ingest_mode || "local_bridge"}
-          </span>
+
+        {/* Header with org info */}
+        <div className="px-6 pt-4 text-xs text-slate-500 flex items-center justify-between">
+          <div>
+            Logged in as <span className="font-semibold">{org.name}</span>{" "}
+            {org.phone && <span>({org.phone})</span>} &mdash; mode:{" "}
+            <span className="font-semibold">
+              {org.ingest_mode || "local_bridge"}
+            </span>
+          </div>
+
+          {/* Simple filter pills: Live / Past / All */}
+          <div className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-1 py-[2px] text-[11px]">
+            <button
+              type="button"
+              onClick={() => setOrderFilter("live")}
+              className={
+                "px-3 py-1 rounded-full transition " +
+                (orderFilter === "live"
+                  ? "bg-slate-900 text-white shadow-sm"
+                  : "text-slate-600 hover:bg-white")
+              }
+            >
+              Live orders ({liveOrders.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setOrderFilter("past")}
+              className={
+                "px-3 py-1 rounded-full transition " +
+                (orderFilter === "past"
+                  ? "bg-slate-900 text-white shadow-sm"
+                  : "text-slate-600 hover:bg-white")
+              }
+            >
+              Past (paid/cancelled) ({pastOrders.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setOrderFilter("all")}
+              className={
+                "hidden sm:inline-flex px-3 py-1 rounded-full transition " +
+                (orderFilter === "all"
+                  ? "bg-slate-900 text-white shadow-sm"
+                  : "text-slate-500 hover:bg-white")
+              }
+            >
+              All ({orders.length})
+            </button>
+          </div>
         </div>
+
+        {/* Content */}
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
           {loadingOrders && (
             <div className="text-slate-500 text-sm">Loading orders…</div>
           )}
 
-          {!loadingOrders && orders.length === 0 && (
+          {!loadingOrders && visibleOrders.length === 0 && (
             <div className="text-slate-500 text-sm">
-              No orders yet. When customers send messages via your mobile
-              bridge, parsed orders will appear here.
+             {orderFilter === "past"
+                ? "No past orders yet (paid/cancelled)."
+                : orderFilter === "live"
+                ? "No active orders. New orders will appear here."
+                : "No orders yet. When customers send messages via your mobile bridge, parsed orders will appear here."}
             </div>
           )}
 
-          {orders.map((o) => (
+          {visibleOrders.map((o) => (
             <div key={o.id} className="max-w-4xl mx-auto">
               <OrderCard
                 o={o as any}
@@ -588,8 +712,7 @@ useEffect(() => {
               {customerOrders.length > 1 && (
                 <div className="w-full mb-2 rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-2 text-[10px] text-indigo-900 flex items-center justify-between gap-2">
                   <div>
-                    This customer has{" "}
-                    <b>{customerOrders.length} orders</b>
+                    This customer has <b>{customerOrders.length} orders</b>
                     {activeOrders.length > 0 && (
                       <>
                         {" "}
@@ -599,7 +722,7 @@ useEffect(() => {
                     .
                   </div>
                   <div className="flex flex-wrap items-center gap-1">
-                    {customerOrders.map((ord) => (
+                    {visibleCustomerOrders.map((ord) => (
                       <button
                         key={ord.id}
                         onClick={() => setSelectedOrderId(ord.id)}
@@ -741,23 +864,26 @@ useEffect(() => {
                         🧾 Send bill
                       </button>
                       {org?.payment_enabled ? (
-  <button
-    onClick={async () => {
-      if (!orgId) return alert("Org missing");
-      if (!activeOrder) return alert("No order selected");
+                        <button
+                          onClick={async () => {
+                            if (!orgId) return alert("Org missing");
+                            if (!activeOrder) return alert("No order selected");
 
-      const r = await sendPaymentQR(orgId, activeOrder.id);
-      if (!r.ok) {
-        alert(r.error || "Failed to send payment QR");
-      } else {
-        alert("Payment QR sent to customer!");
-      }
-    }}
-    className="px-3 py-1 rounded-full bg-purple-600 text-white text-[10px]"
-  >
-    📱 Send Payment QR
-  </button>
-) : null}
+                            const r = await sendPaymentQR(
+                              orgId,
+                              activeOrder.id
+                            );
+                            if (!r.ok) {
+                              alert(r.error || "Failed to send payment QR");
+                            } else {
+                              alert("Payment QR sent to customer!");
+                            }
+                          }}
+                          className="px-3 py-1 rounded-full bg-purple-600 text-white text-[10px]"
+                        >
+                          📱 Send Payment QR
+                        </button>
+                      ) : null}
                     </div>
 
                     {/* Slide-down panels only when clicked (UNCHANGED) */}
@@ -820,16 +946,16 @@ useEffect(() => {
             </>
           ) : (
             <div className="mt-16 text-[12px] text-slate-500">
-              Select a conversation from the left to see the AI-parsed order
-              and reply to the customer.
+              Select a conversation from the left to see the AI-parsed order and
+              reply to the customer.
             </div>
           )}
         </div>
 
         {/* RIGHT: full chat + NEW order history + analytics/settings */}
         {showChat && (
-         <div className="w-72 border-l border-slate-200 bg-white flex flex-col min-h-0">
-    <div className="px-3 py-2 border-b border-slate-200 text-[10px] font-semibold">
+          <div className="w-72 border-l border-slate-200 bg-white flex flex-col min-h-0">
+            <div className="px-3 py-2 border-b border-slate-200 text-[10px] font-semibold">
               Customer context
             </div>
             <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-3 text-[9px]">
@@ -871,82 +997,7 @@ useEffect(() => {
                 </div>
               </div>
 
-              {/* NEW: Order history panel */}
-              <div className="mt-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-[10px]">
-                <div className="mb-1 flex items-center justify-between">
-                  <span className="font-semibold text-slate-800">
-                    Order history
-                  </span>
-                  {customerOrders.length > 0 && selected && (
-                    <span className="text-[9px] text-slate-500">
-                      {customerOrders.length} order
-                      {customerOrders.length !== 1 ? "s" : ""}
-                    </span>
-                  )}
-                </div>
-                {!selected || customerOrders.length === 0 ? (
-                  <div className="text-slate-400">
-                    No previous orders detected for this customer.
-                  </div>
-                ) : (
-                  <div className="space-y-1.5">
-                    {customerOrders.slice(0, 5).map((ord) => {
-                      const created = new Date(
-                        ord.created_at
-                      ).toLocaleString(undefined, {
-                        month: "short",
-                        day: "numeric",
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      });
-                      const statusColor =
-                        ord.status === "paid"
-                          ? "bg-emerald-50 text-emerald-700"
-                          : ord.status === "shipped"
-                          ? "bg-blue-50 text-blue-700"
-                          : "bg-amber-50 text-amber-800";
-                      const statusLabel =
-                        ord.status === "pending"
-                          ? "Pending"
-                          : ord.status === "shipped"
-                          ? "Shipped"
-                          : "Paid";
-                      const firstItem: any =
-                        (ord.items && ord.items[0]) || {};
-                      const label =
-                        (firstItem.canonical ||
-                          firstItem.name ||
-                          "Order") as string;
-
-                      return (
-                        <div
-                          key={ord.id}
-                          className="rounded-lg border border-slate-100 bg-white px-2 py-1.5"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="min-w-0">
-                              <div className="truncate font-medium text-slate-900">
-                                {label}
-                              </div>
-                              <div className="text-[9px] text-slate-500">
-                                {created}
-                              </div>
-                            </div>
-                            <span
-                              className={
-                                "inline-flex items-center rounded-full px-2 py-[1px] text-[9px] " +
-                                statusColor
-                              }
-                            >
-                              {statusLabel}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+              
 
               {/* NEW: Analytics shell */}
               <div className="mt-1 rounded-xl border border-slate-200 bg-white p-3 text-[10px]">

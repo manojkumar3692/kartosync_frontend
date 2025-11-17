@@ -8,15 +8,16 @@ import AdminProducts from "./components/AdminProducts";
 import { setToken, logout } from "./lib/api";
 import Analytics from "./components/Analytics";
 import OrgSettings from "./components/OrgSettings";
+import PastOrders from "./components/PastOrders";
 
-type View = "dashboard" | "inbox" | "products" | "analytics" | "settings"
+type View = "dashboard" | "inbox" | "products" | "analytics" | "settings" | "past"
 
 export default function App() {
   const [authed, setAuthed] = useState<boolean>(() => !!localStorage.getItem("token"));
 
   const [view, setView] = useState<View>(() => {
     const h = (location.hash.replace("#", "") || "").toLowerCase();
-    if (h === "inbox" || h === "products" || h === "dashboard" || h === "analytics" || h === "settings") return h as View;
+    if (h === "inbox" || h === "products" || h === "dashboard" || h === "analytics" || h === "settings" || "past") return h as View;
     return "dashboard";
   });
 
@@ -30,7 +31,7 @@ export default function App() {
   useEffect(() => {
     const onHash = () => {
       const h = (location.hash.replace("#", "") || "").toLowerCase();
-      if (h === "inbox" || h === "products" || h === "dashboard" || h === "analytics" || h === "settings")  {
+      if (h === "inbox" || h === "products" || h === "dashboard" || h === "analytics" || h === "settings" || "past")  {
         setView(h as View);
       }
     };
@@ -84,6 +85,18 @@ export default function App() {
               >
                 🧾 Orders & WhatsApp
               </button>
+
+              <button
+          className={
+            "px-3 py-1.5 rounded-full " +
+            (view === "past"
+              ? "bg-slate-900 text-white"
+              : "bg-slate-100 text-slate-700 hover:bg-slate-200")
+          }
+          onClick={() => goto("past")}
+        >
+          📚 Past orders
+        </button>
 
               <button
                 onClick={() => goto("products")}
@@ -176,6 +189,7 @@ export default function App() {
     <OrgSettings />
   </div>
 )}
+ {view === "past" && <PastOrders />}
             </div>
           </main>
         </>

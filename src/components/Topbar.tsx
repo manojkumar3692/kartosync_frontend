@@ -17,7 +17,7 @@ export default function Topbar({ authed, onLogout }: Props) {
           </div>
           <div className="flex flex-col leading-tight">
             <span className="text-[13px] font-semibold text-slate-900">
-              Karto Orders
+              Kart Order
             </span>
             <span className="text-[11px] text-slate-500">
               AI + WhatsApp Cloud API for local stores
