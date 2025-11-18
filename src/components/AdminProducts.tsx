@@ -10,6 +10,16 @@ import {
 
 type Product = AdminProduct;
 
+// Supported product types (for UI only – backend accepts plain strings)
+const PRODUCT_TYPE_OPTIONS = [
+  "",
+  "grocery",
+  "meat",
+  "seafood",
+  "restaurant",
+  "service",
+];
+
 type ProductDraft = {
   id?: string;
   canonical: string;
@@ -20,7 +30,8 @@ type ProductDraft = {
   variant: string;
   dynamic_price: boolean;
   is_active: boolean;
-  price_per_unit: string; // <- form field (string)
+  price_per_unit: string; // form field
+  product_type: string; // NEW
 };
 
 function emptyDraft(): ProductDraft {
@@ -35,6 +46,7 @@ function emptyDraft(): ProductDraft {
     dynamic_price: false,
     is_active: true,
     price_per_unit: "",
+    product_type: "", // NEW
   };
 }
 
@@ -54,6 +66,7 @@ function toDraft(p?: Product | null): ProductDraft {
       p.price_per_unit != null && !Number.isNaN(p.price_per_unit as any)
         ? String(p.price_per_unit)
         : "",
+    product_type: (p as any).product_type || "", // NEW – defensive read
   };
 }
 
@@ -116,7 +129,6 @@ export default function AdminProducts() {
   }
 
   useEffect(() => {
-    // Initial load
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -177,8 +189,8 @@ export default function AdminProducts() {
 
     try {
       setSaving(true);
-      const payload: AdminProduct = {
-        id: draft.id,
+      const payload: AdminProduct & { product_type?: string | null } = {
+        ...(draft.id ? { id: draft.id } : {}),
         canonical,
         display_name: display_name || canonical,
         category: draft.category.trim() || null,
@@ -187,10 +199,14 @@ export default function AdminProducts() {
         variant: draft.variant.trim() || null,
         dynamic_price: !!draft.dynamic_price,
         is_active: draft.is_active,
-        price_per_unit, // <- send to backend
-      };
+        price_per_unit,
+        // NEW: product_type (normalized to lowercase or null)
+        product_type: draft.product_type.trim()
+          ? draft.product_type.trim().toLowerCase()
+          : null,
+      } as any;
 
-      const resp = await upsertProduct(payload);
+      const resp = await upsertProduct(payload as AdminProduct);
       const saved = resp.product;
       if (!saved) {
         throw new Error(resp as any);
@@ -367,21 +383,21 @@ export default function AdminProducts() {
                   <button
                     className="rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-[11px] text-gray-700 hover:bg-gray-100"
                     onClick={() => {
-                      setDraft((prev) => ({
+                      const first = g.variants[0];
+                      setDraft({
                         ...emptyDraft(),
                         canonical: g.canonical,
                         display_name:
-                          prev.display_name ||
-                          g.variants[0]?.display_name ||
-                          g.canonical,
-                        category: g.variants[0]?.category || "",
-                        base_unit: g.variants[0]?.base_unit || "",
+                          first?.display_name || g.canonical,
+                        category: first?.category || "",
+                        base_unit: first?.base_unit || "",
                         brand: "",
                         variant: "",
                         dynamic_price: false,
                         is_active: true,
                         price_per_unit: "",
-                      }));
+                        product_type: (first as any)?.product_type || "",
+                      });
                       setShowModal(true);
                     }}
                     title="Add another variant/brand for this product"
@@ -399,6 +415,7 @@ export default function AdminProducts() {
                         <th className="px-2 text-left">Brand</th>
                         <th className="px-2 text-left">Variant</th>
                         <th className="px-2 text-left">Category</th>
+                        <th className="px-2 text-left">Type</th>
                         <th className="px-2 text-left">Base unit</th>
                         <th className="px-2 text-left">Price / unit</th>
                         <th className="px-2 text-center">Dynamic price</th>
@@ -434,6 +451,17 @@ export default function AdminProducts() {
                           <td className="bg-gray-50 px-2 py-1 text-gray-800">
                             {p.category || (
                               <span className="text-gray-400">—</span>
+                            )}
+                          </td>
+                          <td className="bg-gray-50 px-2 py-1 text-gray-800">
+                            {(p as any).product_type ? (
+                              <span className="uppercase text-[10px] tracking-wide text-gray-700">
+                                {(p as any).product_type}
+                              </span>
+                            ) : (
+                              <span className="text-gray-300 text-[10px]">
+                                general
+                              </span>
                             )}
                           </td>
                           <td className="bg-gray-50 px-2 py-1 text-gray-800">
@@ -520,14 +548,16 @@ export default function AdminProducts() {
                     </label>
                     <input
                       className="w-full rounded-md border border-gray-300 px-2 py-1 text-sm"
-                      placeholder="e.g., Chicken, Onion, Colgate Toothpaste"
+                      placeholder="e.g., Chicken, Onion, Veg Meals"
                       value={draft.canonical}
                       onChange={(e) =>
                         setDraft((d) => ({ ...d, canonical: e.target.value }))
                       }
                     />
                     <p className="mt-1 text-[10px] text-gray-400">
-                      This is what the customer usually says in WhatsApp.
+                      This is what the customer usually types in WhatsApp
+                      (e.g., &quot;chicken biryani&quot;, &quot;meals&quot;,
+                      &quot;hair cut&quot;).
                     </p>
                   </div>
 
@@ -537,7 +567,7 @@ export default function AdminProducts() {
                     </label>
                     <input
                       className="w-full rounded-md border border-gray-300 px-2 py-1 text-sm"
-                      placeholder="e.g., Chicken – Skinless curry cut"
+                      placeholder="e.g., Chicken – Skinless curry cut / Veg Meals – Full"
                       value={draft.display_name}
                       onChange={(e) =>
                         setDraft((d) => ({
@@ -554,7 +584,7 @@ export default function AdminProducts() {
                     </label>
                     <input
                       className="w-full rounded-md border border-gray-300 px-2 py-1 text-sm"
-                      placeholder="Meat / Vegetables / Toiletries…"
+                      placeholder="Meat / Vegetables / Toiletries / Mains…"
                       value={draft.category}
                       onChange={(e) =>
                         setDraft((d) => ({ ...d, category: e.target.value }))
@@ -564,11 +594,37 @@ export default function AdminProducts() {
 
                   <div>
                     <label className="mb-1 block text-[11px] text-gray-500">
+                      Product type
+                    </label>
+                    <select
+                      className="w-full rounded-md border border-gray-300 px-2 py-1 text-sm"
+                      value={draft.product_type}
+                      onChange={(e) =>
+                        setDraft((d) => ({ ...d, product_type: e.target.value }))
+                      }
+                    >
+                      {PRODUCT_TYPE_OPTIONS.map((t) => (
+                        <option key={t || "general"} value={t}>
+                          {t === ""
+                            ? "General / grocery"
+                            : t.charAt(0).toUpperCase() + t.slice(1)}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-1 text-[10px] text-gray-400">
+                      Helps AI tune matching. For biryani / meals use{" "}
+                      <b>restaurant</b>, for chicken/mutton use <b>meat</b>, for
+                      hair cut / facial use <b>service</b>.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[11px] text-gray-500">
                       Base unit
                     </label>
                     <input
                       className="w-full rounded-md border border-gray-300 px-2 py-1 text-sm"
-                      placeholder="kg / piece / pack / litre…"
+                      placeholder="kg / piece / pack / plate / combo…"
                       value={draft.base_unit}
                       onChange={(e) =>
                         setDraft((d) => ({ ...d, base_unit: e.target.value }))
@@ -582,7 +638,7 @@ export default function AdminProducts() {
                     </label>
                     <input
                       className="w-full rounded-md border border-gray-300 px-2 py-1 text-sm"
-                      placeholder="e.g., Store brand, Colgate"
+                      placeholder="e.g., Store brand, Almarai, Colgate"
                       value={draft.brand}
                       onChange={(e) =>
                         setDraft((d) => ({ ...d, brand: e.target.value }))
@@ -596,7 +652,7 @@ export default function AdminProducts() {
                     </label>
                     <input
                       className="w-full rounded-md border border-gray-300 px-2 py-1 text-sm"
-                      placeholder="e.g., Skinless curry cut, Big onion, MaxFresh 150g"
+                      placeholder="e.g., Skinless curry cut, Full meals, 1L, 500g"
                       value={draft.variant}
                       onChange={(e) =>
                         setDraft((d) => ({ ...d, variant: e.target.value }))
@@ -610,7 +666,7 @@ export default function AdminProducts() {
                     </label>
                     <input
                       className="w-full rounded-md border border-gray-300 px-2 py-1 text-sm"
-                      placeholder="e.g., 120 (for 120 per kg)"
+                      placeholder="e.g., 120 (for 120 per kg / plate)"
                       value={draft.price_per_unit}
                       onChange={(e) =>
                         setDraft((d) => ({

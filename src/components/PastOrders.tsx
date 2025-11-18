@@ -1,6 +1,9 @@
 // src/components/PastOrders.tsx
 import { useEffect, useMemo, useState } from "react";
-import api, { Order, logout as apiLogout, me as apiMe } from "../lib/api";
+import api, { logout as apiLogout, me as apiMe } from "../lib/api";
+
+// TEMP severe fallback until backend types are updated
+export type Order = any;
 import Topbar from "./Topbar";
 
 type StatusFilter = "paid" | "cancelled" | "all";

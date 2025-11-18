@@ -80,10 +80,10 @@ export type Item = {
   category?: string | null;
 };
 
-export type Order = {
+type Order = {
   id: string;
   created_at: string;
-  status: OrderStatus;
+  status: "pending" | "shipped" | "paid" | "cancelled";
   customer_name?: string | null;
   source_phone?: string | null;
   raw_text?: string | null;
@@ -91,6 +91,14 @@ export type Order = {
   items?: Item[];
   parse_reason?: string | null;
   parse_confidence?: number | null;
+  link_reason?: string | null;
+
+  // 🔹 NEW: backend-computed total (once you add it)
+  order_total?: number | null;
+  // optional if you add it later
+  pricing_locked?: boolean | null;
+  // 🔹 NEW
+  shipping_address?: string | null;
 };
 
 // Inbox types
@@ -127,6 +135,7 @@ export type AdminProduct = {
   brand?: string | null;
   is_active?: boolean;
   price_per_unit?: number | null; 
+  product_type?: string | null;
 };
 
 export type ListProductsResponse = {

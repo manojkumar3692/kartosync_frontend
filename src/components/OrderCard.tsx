@@ -3,7 +3,7 @@
 // + Operator overrides: Split to New Order (per line) & Merge with Previous (card-level)
 // + Price per line, order total & "Send summary" to WhatsApp / WABA
 import React, { useEffect, useMemo, useState } from "react";
-import {
+import api, {
   aiFixOrder,
   getClarifyLink,
   updateStatus,
@@ -15,7 +15,7 @@ import {
 } from "../lib/api";
 import { timeAgo, useTicker } from "../lib/time";
 import { OrderReasonChips } from "./OrderReasonChips";
-
+import { deriveKindFromParseReason, ParsedKind } from "../utils/parseKind";
 // ─────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────
@@ -51,6 +51,12 @@ type Order = {
   parse_reason?: string | null;
   parse_confidence?: number | null;
   link_reason?: string | null;
+    // 🔹 NEW: backend-computed total (once you add it)
+    order_total?: number | null;
+    // optional if you add it later
+    pricing_locked?: boolean | null;
+    // 🔹 NEW
+  shipping_address?: string | null;
 };
 
 type Props = {
@@ -134,14 +140,14 @@ function buildWAWebLink(phoneLike: string, text: string) {
   return `https://api.whatsapp.com/send?phone=${digits}&text=${enc}`;
 }
 
-function inquiryKind(
-  parseReason?: string | null
-): "price" | "availability" | null {
-  const r = (parseReason || "").toLowerCase();
-  if (r.startsWith("inq:price")) return "price";
-  if (r.startsWith("inq:availability")) return "availability";
-  return null;
-}
+// function inquiryKind(
+//   parseReason?: string | null
+// ): "price" | "availability" | null {
+//   const r = (parseReason || "").toLowerCase();
+//   if (r.startsWith("inq:price")) return "price";
+//   if (r.startsWith("inq:availability")) return "availability";
+//   return null;
+// }
 
 // Build order summary text with price lines + total
 // If prices are missing, the total will be 0.00 as a safe default.
@@ -185,6 +191,10 @@ function buildOrderSummaryText(o: Order, subtotal: number) {
 // ─────────────────────────────────────────────────────
 
 export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
+
+  const [editingAddress, setEditingAddress] = useState(false);
+const [addressDraft, setAddressDraft] = useState(o.shipping_address || "");
+const [savingAddress, setSavingAddress] = useState(false);
   const isWaba = useMemo(() => {
     if (modeHint === "waba") return true;
     if (modeHint === "local") return false;
@@ -332,19 +342,23 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
     return candidates[0];
   }
 
-    // ─────────────────────────────────────────────
-  // Auto-enrich items with price from catalog for display
-  // (does NOT write back to DB; just used for UI & WhatsApp messages)
-  // ─────────────────────────────────────────────
   const enrichedItems: Item[] = useMemo(() => {
     const src = o.items || [];
-    if (!src.length || !catalog.length) return src;
-
+    if (!src.length) return src;
+  
+    // 🔹 IMPORTANT:
+    // For shipped/paid orders, DON'T auto-enrich from catalog.
+    // Just show whatever is saved in DB so totals stay frozen.
+    if (o.status === "shipped" || o.status === "paid") {
+      return src;
+    }
+  
+    if (!catalog.length) return src;
+  
     return src.map((it) => {
       const qty =
         typeof it.qty === "number" && !Number.isNaN(it.qty) ? it.qty : 1;
-
-      // start from existing price fields
+  
       let price =
         typeof it.price_per_unit === "number" &&
         !Number.isNaN(it.price_per_unit)
@@ -354,8 +368,7 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
         typeof it.line_total === "number" && !Number.isNaN(it.line_total)
           ? it.line_total
           : null;
-
-      // if no price yet → try catalog (canonical + variant)
+  
       if (price == null) {
         const product = findMatchingProduct(
           it.canonical || it.name || "",
@@ -369,20 +382,18 @@ export default function OrderCard({ o, onChange, modeHint, orgId }: Props) {
           price = product.price_per_unit;
         }
       }
-
-      // if we now have a price but no line_total → compute it
+  
       if (lineTotal == null && price != null) {
         lineTotal = qty * price;
       }
-
-      // return an item with enriched price fields
+  
       return {
         ...it,
         price_per_unit: price,
         line_total: lineTotal,
       };
     });
-  }, [o.items, catalog]);
+  }, [o.items, o.status, catalog]);
 
   function openFix() {
     setFixItems(
@@ -485,7 +496,22 @@ if (product && product.price_per_unit != null) {
   const createdAgo = timeAgo(o.created_at, tickNow);
 
   // Inquiry helpers
-  const inq = inquiryKind(o.parse_reason);
+  const parsedKind: ParsedKind = useMemo(
+    () => deriveKindFromParseReason(o.parse_reason || null),
+    [o.parse_reason]
+  );
+
+  // normalize to a simple "price"/"availability"/"menu"/null
+  const inq: "price" | "availability" | "menu" | null =
+    parsedKind === "price_inquiry" || parsedKind === "mixed_order_price"
+      ? "price"
+      : parsedKind === "availability_inquiry" ||
+        parsedKind === "mixed_order_availability"
+      ? "availability"
+      : parsedKind === "menu_request"
+      ? "menu"
+      : null;
+
   const firstName = o.customer_name ? ` ${o.customer_name}` : "";
   const firstItem = (o.items && o.items[0]) || null;
   const itemLabel = (firstItem?.canonical || firstItem?.name || "").trim();
@@ -742,11 +768,9 @@ if (product && product.price_per_unit != null) {
     return arr.join(" · ");
   }, [o.items]);
 
-// Price subtotal: use price_per_unit if present, otherwise fall back to line_total
-  // Price subtotal: use enrichedItems (which already pulled from catalog)
 // Price subtotal: use enrichedItems (catalog-enriched)
-// Prefer price_per_unit; if missing, fall back to line_total
-const { subtotal, hasAnyPrice } = useMemo(() => {
+// Prefer backend order_total; fall back to computed subtotal
+const { subtotal, hasAnyPrice, totalForDisplay } = useMemo(() => {
   let sum = 0;
   let anyPrice = false;
 
@@ -774,16 +798,65 @@ const { subtotal, hasAnyPrice } = useMemo(() => {
     }
   });
 
-  return { subtotal: sum, hasAnyPrice: anyPrice };
-}, [enrichedItems]);
+  const backendTotal =
+    typeof o.order_total === "number" && !Number.isNaN(o.order_total)
+      ? o.order_total
+      : null;
 
-
-
-  async function setStatus(s: Order["status"]) {
-    if (s === o.status) return;
-    await updateStatus(o.id, s);
-    onChange();
+  if (backendTotal != null) {
+    anyPrice = true; // we *do* have a usable total
   }
+
+  const totalForDisplay = backendTotal ?? sum;
+
+  return { subtotal: sum, hasAnyPrice: anyPrice, totalForDisplay };
+}, [enrichedItems, o.order_total]);
+
+
+
+async function setStatus(s: Order["status"]) {
+  if (s === o.status) return;
+
+  const goingToFinal =
+    s === "shipped" || s === "paid";
+
+  // If moving to shipped/paid: freeze current enriched prices into DB
+  if (goingToFinal && enrichedItems.length) {
+    try {
+      await aiFixOrder(o.id, {
+        items: enrichedItems.map((it) => ({
+          qty:
+            it.qty == null || Number.isNaN(it.qty as any)
+              ? null
+              : Number(it.qty),
+          unit: (it.unit || "")?.trim() || null,
+          canonical: (it.canonical || "")?.trim() || null,
+          name: (it.name || "")?.trim() || undefined,
+          brand: (it.brand || "")?.trim() || null,
+          variant: (it.variant || "")?.trim() || null,
+          notes: (it.notes || "")?.trim() || null,
+          price_per_unit:
+            it.price_per_unit == null ||
+            Number.isNaN(it.price_per_unit as any)
+              ? null
+              : Number(it.price_per_unit),
+          line_total:
+            it.line_total == null ||
+            Number.isNaN(it.line_total as any)
+              ? null
+              : Number(it.line_total),
+        })),
+        reason: `freeze_pricing_on_${s}`,
+      });
+    } catch (e) {
+      console.error("[OrderCard] failed to freeze pricing before status change", e);
+      // we still continue to update status so flow is not blocked
+    }
+  }
+
+  await updateStatus(o.id, s);
+  onChange();
+}
 
   const onDelete = async () => {
     if (!confirm("Delete this order? This cannot be undone.")) return;
@@ -824,7 +897,7 @@ const { subtotal, hasAnyPrice } = useMemo(() => {
     if (!o.source_phone) return;
     const text = buildOrderSummaryText(
       { ...o, items: enrichedItems },
-      subtotal
+      totalForDisplay
     );
 
     if (canSendWaba) {
@@ -883,7 +956,12 @@ const { subtotal, hasAnyPrice } = useMemo(() => {
                 title="Detected as a customer inquiry (not an order)"
               >
                 <span className="inline-block h-1.5 w-1.5 rounded-full bg-purple-500" />
-                Inquiry: {inq === "price" ? "Price" : "Availability"}
+                Inquiry:{" "}
+                {inq === "price"
+                  ? "Price"
+                  : inq === "availability"
+                  ? "Availability"
+                  : "Menu"}
               </span>
             )}
 
@@ -1220,9 +1298,90 @@ const { subtotal, hasAnyPrice } = useMemo(() => {
             {hasAnyPrice ? "Total:" : "Total (no prices set):"}
           </span>
           <span className="font-semibold">
-            {CURRENCY} {subtotal.toFixed(2)}
+            {CURRENCY} {totalForDisplay.toFixed(2)}
           </span>
         </div>
+
+        {/* Delivery address (WABA only, but you can remove isWaba if you want for local too) */}
+        {isWaba && (
+          <div className="mt-3 border border-slate-200 rounded-lg bg-slate-50 px-3 py-2">
+            <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
+              <span>Delivery address</span>
+              {!editingAddress && (
+                <button
+                  type="button"
+                  className="text-[11px] text-indigo-600 hover:underline"
+                  onClick={() => setEditingAddress(true)}
+                >
+                  {o.shipping_address ? "Edit" : "Add"}
+                </button>
+              )}
+            </div>
+
+            {!editingAddress && (
+              <div className="mt-1 text-[11px] text-slate-800 whitespace-pre-line">
+                {o.shipping_address && o.shipping_address.trim().length > 0 ? (
+                  o.shipping_address
+                ) : (
+                  <span className="text-slate-400">
+                    No address captured yet. Ask the customer on WhatsApp or wait
+                    for AI to capture it.
+                  </span>
+                )}
+              </div>
+            )}
+
+            {editingAddress && (
+              <div className="mt-2 space-y-2">
+                <textarea
+                  className="w-full border border-slate-300 rounded-md px-2 py-1 text-[11px] bg-white resize-y min-h-[70px]"
+                  value={addressDraft}
+                  onChange={(e) => setAddressDraft(e.target.value)}
+                  placeholder="Flat / villa, building, street, area, city, landmark…"
+                />
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={savingAddress}
+                    onClick={async () => {
+                      try {
+                        setSavingAddress(true);
+                        await api.patch(`/api/orders/${o.id}`, {
+                          shipping_address: addressDraft.trim() || null,
+                        });
+                        setEditingAddress(false);
+                        onChange(); // refresh orders in Dashboard
+                      } catch (e) {
+                        console.error("[OrderCard] save address failed", e);
+                        alert("Could not save address. Please try again.");
+                      } finally {
+                        setSavingAddress(false);
+                      }
+                    }}
+                    className={
+                      "px-3 py-[5px] rounded-full text-[11px] font-medium " +
+                      (savingAddress
+                        ? "bg-slate-300 text-slate-600"
+                        : "bg-emerald-600 text-white hover:bg-emerald-500")
+                    }
+                  >
+                    {savingAddress ? "Saving…" : "Save address"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingAddress(false);
+                      setAddressDraft(o.shipping_address || "");
+                    }}
+                    className="px-3 py-[5px] rounded-full text-[11px] bg-slate-100 text-slate-600 hover:bg-slate-200"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* raw/audio toggles */}
         <div className="mt-2 flex gap-2">
