@@ -121,6 +121,20 @@ export type InboxMessage = {
   wa_msg_id?: string | null;
 };
 
+export type CustomerAutoReplyState = {
+  enabled: boolean;
+  last_inquiry_at?: string | null;
+  last_inquiry_canonical?: string | null;
+  last_inquiry_text?: string | null;
+  last_inquiry_kind?: "price" | "availability" | "menu" | "other" | null;
+  last_inquiry_status?: "unresolved" | "resolved" | null;
+};
+// Org-level auto-reply toggle
+export type OrgAutoReplyState = {
+  org_id: string;
+  auto_reply_enabled: boolean;
+};
+
 // ─────────────────────────────────────────────────────────
 // NEW: Admin Product types
 // ─────────────────────────────────────────────────────────
@@ -262,6 +276,83 @@ export async function getInboxMessages(orgId: string, conversationId: string) {
     { params: { org_id: orgId } }
   );
   return (data.messages || []) as InboxMessage[];
+}
+
+// ─────────────────────────────────────────────────────────
+/** Auto-reply & inquiry helpers */
+// ─────────────────────────────────────────────────────────
+
+// Org-level auto-reply toggle
+export async function setOrgAutoReply(
+  orgId: string,
+  enabled: boolean
+): Promise<OrgAutoReplyState> {
+  const { data } = await api.post(`/api/org/auto-reply`, {
+    org_id: orgId,
+    enabled,
+  });
+  // backend may wrap in { ok, ... } or return plain object – be defensive
+  const payload = (data as any)?.org_id ? data : (data as any)?.data ?? data;
+  return payload as OrgAutoReplyState;
+}
+
+// Get per-customer auto-reply state + last inquiry info
+export async function getCustomerAutoReply(
+  orgId: string,
+  phone: string
+): Promise<CustomerAutoReplyState> {
+  const { data } = await api.get(`/api/inbox/auto_reply`, {
+    params: { org_id: orgId, phone },
+  });
+  const raw = data as any;
+  const rawKind = raw.last_inquiry_kind ?? null;
+  const allowedKinds = ["price", "availability", "menu", "other"] as const;
+  const normKind = allowedKinds.includes(rawKind) ? rawKind : null;
+
+  return {
+    enabled: !!raw.enabled,
+    last_inquiry_at: raw.last_inquiry_at ?? null,
+    last_inquiry_canonical: raw.last_inquiry_canonical ?? null,
+    last_inquiry_text: raw.last_inquiry_text ?? null,
+    last_inquiry_kind: normKind,
+    last_inquiry_status: raw.last_inquiry_status ?? null,
+  };
+}
+
+// Set per-customer auto-reply state
+export async function setCustomerAutoReply(
+  orgId: string,
+  phone: string,
+  enabled: boolean
+): Promise<CustomerAutoReplyState> {
+  const { data } = await api.post(`/api/inbox/auto_reply`, {
+    org_id: orgId,
+    phone,
+    enabled,
+  });
+  return {
+    enabled: !!(data as any).enabled,
+    last_inquiry_at: (data as any).last_inquiry_at ?? null,
+    last_inquiry_canonical: (data as any).last_inquiry_canonical ?? null,
+  };
+}
+
+// Mark an inquiry as resolved (best-effort; backend may no-op)
+export async function markInquiryResolved(
+  orgId: string,
+  phone: string,
+  inquiry_at?: string | null,
+  canonical?: string | null
+): Promise<{ ok: boolean }> {
+  const { data } = await api.post(`/api/inbox/inquiry_resolved`, {
+    org_id: orgId,
+    phone,
+    inquiry_at: inquiry_at ?? null,
+    canonical: canonical ?? null,
+  });
+  return {
+    ok: !!((data as any)?.ok ?? true),
+  };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -457,5 +548,8 @@ export async function listPastOrders() {
   const res = await api.get("/api/orders/past?limit=200");
   return res.data;
 }
+
+
+
 
 export default api;

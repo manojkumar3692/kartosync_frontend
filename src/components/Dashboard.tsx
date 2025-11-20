@@ -7,6 +7,10 @@ import api, {
   me as apiMe,
   sendInboxMessage,
   sendPaymentQR,
+  setOrgAutoReply,
+  getCustomerAutoReply,
+  setCustomerAutoReply,
+  markInquiryResolved,
 } from "../lib/api";
 
 export type Order = any;
@@ -91,6 +95,25 @@ export default function Dashboard() {
     [messages]
   );
 
+
+    // 🔹 Derived per-customer value using map + org fallback
+    const phoneKey = selected?.customer_phone
+    ? selected.customer_phone.replace(/[^\d]/g, "")
+    : "";
+
+  const customerAutoReply =
+    phoneKey && phoneKey in autoReplyMap
+      ? autoReplyMap[phoneKey]
+      : autoReplyEnabled;
+
+
+
+      const showInquiryCard = !!(
+        selected &&
+        lastInquiry &&
+        lastInquiry.last_inquiry_status !== "resolved"
+      );
+
   // ───────────────── org + auth ─────────────────
   useEffect(() => {
     (async () => {
@@ -147,7 +170,7 @@ export default function Dashboard() {
   }, [isWaba, orgId, selected?.customer_phone]);
 
 
- // NEW: Per-customer auto-reply status + last enquiry snapshot
+// NEW: Per-customer auto-reply status + last enquiry snapshot
 useEffect(() => {
   if (!isWaba || !orgId || !selected?.customer_phone) return;
 
@@ -155,37 +178,28 @@ useEffect(() => {
 
   (async () => {
     try {
-      const { data } = await api.get("/api/inbox/auto_reply", {
-        params: { org_id: orgId, phone: phoneKey },
-      });
+      const state = await getCustomerAutoReply(orgId, phoneKey);
 
       // 1) auto-reply ON/OFF
-      if (typeof data?.enabled === "boolean") {
-        setAutoReplyMap((prev) => ({
-          ...prev,
-          [phoneKey]: data.enabled,
-        }));
-      }
+      setAutoReplyMap((prev) => ({
+        ...prev,
+        [phoneKey]: state.enabled,
+      }));
 
       // 2) last enquiry snapshot (from org_customer_settings)
-      if (data?.last_inquiry_text) {
-        const rawKind = (data.last_inquiry_kind as string | null) || null;
-        const normKind =
-          rawKind === "price" || rawKind === "availability" ? rawKind : null;
-      
+      if (state.last_inquiry_text) {
         setLastInquiry({
-          last_inquiry_text: data.last_inquiry_text,
-          last_inquiry_kind: normKind,
-          last_inquiry_canonical: data.last_inquiry_canonical ?? null,
-          last_inquiry_at: data.last_inquiry_at ?? null,
-          last_inquiry_status:
-            (data.last_inquiry_status as "unresolved" | "resolved" | null) ?? null,
+          last_inquiry_text: state.last_inquiry_text,
+          last_inquiry_kind: state.last_inquiry_kind ?? null,
+          last_inquiry_canonical: state.last_inquiry_canonical ?? null,
+          last_inquiry_at: state.last_inquiry_at ?? null,
+          last_inquiry_status: state.last_inquiry_status ?? null,
         });
       } else {
         setLastInquiry(null);
       }
     } catch (e) {
-      console.error("[Dashboard] get auto_reply failed", e);
+      console.error("[Dashboard] getCustomerAutoReply failed", e);
       setLastInquiry(null);
     }
   })();
@@ -204,23 +218,18 @@ useEffect(() => {
   // 4️⃣ Per-customer auto-reply route usage
   const handleToggleCustomerAutoReply = async (phoneRaw: string) => {
     if (!orgId || !phoneRaw) return;
-    const phoneKey = phoneRaw.replace(/[^\d]/g, ""); // same normalization
-
+    const phoneKey = phoneRaw.replace(/[^\d]/g, "");
+  
     const current = autoReplyMap[phoneKey] ?? true;
     const next = !current;
-
+  
     setAutoReplyBusy(true);
     setAutoReplyMap((prev) => ({ ...prev, [phoneKey]: next }));
-
+  
     try {
-      await api.post("/api/inbox/auto_reply", {
-        org_id: orgId,
-        phone: phoneKey,
-        enabled: next,
-      });
+      await setCustomerAutoReply(orgId, phoneKey, next);
     } catch (e) {
       console.error("[Dashboard] customer auto-reply toggle failed", e);
-      // revert on error
       setAutoReplyMap((prev) => ({ ...prev, [phoneKey]: current }));
       alert("Could not update auto-reply for this customer. Please try again.");
     } finally {
@@ -384,30 +393,35 @@ useEffect(() => {
   
       const rawArr = Array.isArray(data) ? data : [];
   
-      const arr: Message[] = rawArr.map((m: any) => {
-        // Decide who sent it
+      const mapped: Message[] = rawArr.map((m: any) => {
         const from: "customer" | "store" =
           m.from ??
           (m.direction === "in" || m.sender_type === "customer"
             ? "customer"
             : "store");
   
-        // Text body
         const text: string = m.text ?? m.body ?? "";
   
-        // Timestamp
-        const ts: string =
-          m.ts ?? m.created_at ?? new Date().toISOString();
+        const ts: string = m.ts ?? m.created_at ?? new Date().toISOString();
   
         return {
-          id: String(m.id || m.wa_msg_id || Math.random()),
+          id: String(m.id || m.wa_msg_id || `${from}-${ts}-${text}`),
           from,
           text,
           ts,
         };
       });
   
-      setMessages(arr);
+      // 🔹 DEDUPE HERE – avoid duplicate bubbles for the same message
+      const seen = new Set<string>();
+      const deduped = mapped.filter((m) => {
+        const key = `${m.from}|${m.text}|${m.ts}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  
+      setMessages(deduped);
     } catch (e) {
       console.error("[Inbox] messages failed", e);
       setMessages([]);
@@ -445,43 +459,34 @@ useEffect(() => {
       };
       setMessages((m) => [...m, optimistic]);
   
-      await api.post("/api/inbox/send", {
-        org_id: orgId,
-        phone: phonePlain,
-        text,
-      });
+      // Use wrapper
+      await sendInboxMessage(orgId, phonePlain, text);
   
       setInput("");
       await loadMessages(selected);
   
-      // 🔹 If auto-reply was ON for this customer, turn it OFF after human reply
+      // If auto-reply was ON for this customer, turn it OFF after human reply
       if (customerAutoReply) {
         await handleToggleCustomerAutoReply(selected.customer_phone);
       }
   
-      // 🔹 NEW: if there was an unresolved inquiry, mark it resolved (locally + backend)
+      // If there was an unresolved inquiry, mark it resolved (locally + backend)
       if (showInquiryCard && lastInquiry) {
         // Optimistic local update – hide card immediately
         setLastInquiry((prev) =>
-          prev
-            ? {
-                ...prev,
-                last_inquiry_status: "resolved",
-              }
-            : prev
+          prev ? { ...prev, last_inquiry_status: "resolved" } : prev
         );
   
-        // Best-effort backend sync – adjust endpoint name/body to match your API
         try {
-          await api.post("/api/inbox/inquiry_resolved", {
-            org_id: orgId,
-            phone: phonePlain,
-            inquiry_at: lastInquiry.last_inquiry_at ?? null,
-            canonical: lastInquiry.last_inquiry_canonical ?? null,
-          });
+          await markInquiryResolved(
+            orgId,
+            phonePlain,
+            lastInquiry.last_inquiry_at ?? null,
+            lastInquiry.last_inquiry_canonical ?? null
+          );
         } catch (e) {
           console.error("[Dashboard] mark inquiry resolved failed", e);
-          // We *don't* revert UI; worst case, a fresh page load will re-sync from server
+          // no UI rollback needed – a fresh reload will re-sync
         }
       }
     } catch (e) {
@@ -545,12 +550,9 @@ useEffect(() => {
     setAutoReplyEnabled(next);
     setAutoReplySaving(true);
     try {
-      const { data } = await api.post("/api/org/auto-reply", {
-        org_id: orgId,
-        enabled: next,
-      });
-      if (typeof data?.auto_reply_enabled === "boolean") {
-        setAutoReplyEnabled(data.auto_reply_enabled);
+      const state = await setOrgAutoReply(orgId, next);
+      if (typeof state.auto_reply_enabled === "boolean") {
+        setAutoReplyEnabled(state.auto_reply_enabled);
       }
     } catch (e) {
       console.error("[Dashboard] toggle auto-reply failed", e);
@@ -560,23 +562,6 @@ useEffect(() => {
       setAutoReplySaving(false);
     }
   };
-
-  // 🔹 Derived per-customer value using map + org fallback
-  const phoneKey = selected?.customer_phone
-    ? selected.customer_phone.replace(/[^\d]/g, "")
-    : "";
-
-  const customerAutoReply =
-    phoneKey && phoneKey in autoReplyMap
-      ? autoReplyMap[phoneKey]
-      : autoReplyEnabled;
-
-      const showInquiryCard = !!(
-        selected &&
-        lastInquiry &&
-        lastInquiry.last_inquiry_status !== "resolved"
-      );
-
         // Smoothly open the QuickReplyPrice panel and scroll it into view
   const openPricePanel = () => {
     setShowAvailPanel(false);
@@ -1291,4 +1276,3 @@ useEffect(() => {
     </div>
   );
 }
-    
