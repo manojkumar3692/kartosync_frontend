@@ -1,6 +1,6 @@
 // src/components/Dashboard.tsx
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import api, {
   listOrders,
   logout as apiLogout,
@@ -53,9 +53,9 @@ export default function Dashboard() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [loadingOrders, setLoadingOrders] = useState(false);
 
-    // Filter for live vs past orders (non-WABA view)
-   // "live" = pending + shipped, "past" = paid + cancelled, "all" = everything
-   const [orderFilter, setOrderFilter] = useState<"live" | "past" | "all">(
+  // Filter for live vs past orders (non-WABA view)
+  // "live" = pending + shipped, "past" = paid + cancelled, "all" = everything
+  const [orderFilter, setOrderFilter] = useState<"live" | "past" | "all">(
     "live"
   );
 
@@ -89,15 +89,13 @@ export default function Dashboard() {
   const [autoReplyBusy, setAutoReplyBusy] = useState(false);
   const [lastInquiry, setLastInquiry] = useState<InquiryInfo | null>(null);
 
-
   const lastMessageKey = useMemo(
     () => (messages.length ? messages[messages.length - 1].id : null),
     [messages]
   );
 
-
-    // 🔹 Derived per-customer value using map + org fallback
-    const phoneKey = selected?.customer_phone
+  // 🔹 Derived per-customer value using map + org fallback
+  const phoneKey = selected?.customer_phone
     ? selected.customer_phone.replace(/[^\d]/g, "")
     : "";
 
@@ -106,13 +104,50 @@ export default function Dashboard() {
       ? autoReplyMap[phoneKey]
       : autoReplyEnabled;
 
+  const showInquiryCard = !!(
+    selected &&
+    lastInquiry &&
+    lastInquiry.last_inquiry_status !== "resolved"
+  );
 
+  // 🔹 Chat scroll handling (right panel)
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
-      const showInquiryCard = !!(
-        selected &&
-        lastInquiry &&
-        lastInquiry.last_inquiry_status !== "resolved"
-      );
+  const scrollChatToBottom = (smooth = false) => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const behavior = smooth ? "smooth" : "auto";
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  };
+
+  const handleChatScroll = () => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setShowJumpToLatest(distance > 120);
+  };
+
+  // When switching conversations, always jump to latest
+  useEffect(() => {
+    if (!selected) return;
+    scrollChatToBottom(false);
+    setShowJumpToLatest(false);
+  }, [selected?.id]);
+
+  // When new messages arrive, auto-scroll if user is near bottom
+  useEffect(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const isNearBottom = distance < 120;
+    if (isNearBottom) {
+      scrollChatToBottom(false);
+      setShowJumpToLatest(false);
+    } else if (messages.length) {
+      setShowJumpToLatest(true);
+    }
+  }, [messages.length]);
 
   // ───────────────── org + auth ─────────────────
   useEffect(() => {
@@ -158,52 +193,51 @@ export default function Dashboard() {
     })();
   }, [orgId]);
 
-
+  // Poll messages for the selected conversation
   useEffect(() => {
     if (!isWaba || !orgId || !selected) return;
-  
+
     const t = setInterval(() => {
       loadMessages(selected);
     }, 12000); // or 5000 if you want faster
-  
+
     return () => clearInterval(t);
   }, [isWaba, orgId, selected?.customer_phone]);
 
+  // NEW: Per-customer auto-reply status + last enquiry snapshot
+  useEffect(() => {
+    if (!isWaba || !orgId || !selected?.customer_phone) return;
 
-// NEW: Per-customer auto-reply status + last enquiry snapshot
-useEffect(() => {
-  if (!isWaba || !orgId || !selected?.customer_phone) return;
+    const phoneKey = selected.customer_phone.replace(/[^\d]/g, "");
 
-  const phoneKey = selected.customer_phone.replace(/[^\d]/g, "");
+    (async () => {
+      try {
+        const state = await getCustomerAutoReply(orgId, phoneKey);
 
-  (async () => {
-    try {
-      const state = await getCustomerAutoReply(orgId, phoneKey);
+        // 1) auto-reply ON/OFF
+        setAutoReplyMap((prev) => ({
+          ...prev,
+          [phoneKey]: state.enabled,
+        }));
 
-      // 1) auto-reply ON/OFF
-      setAutoReplyMap((prev) => ({
-        ...prev,
-        [phoneKey]: state.enabled,
-      }));
-
-      // 2) last enquiry snapshot (from org_customer_settings)
-      if (state.last_inquiry_text) {
-        setLastInquiry({
-          last_inquiry_text: state.last_inquiry_text,
-          last_inquiry_kind: state.last_inquiry_kind ?? null,
-          last_inquiry_canonical: state.last_inquiry_canonical ?? null,
-          last_inquiry_at: state.last_inquiry_at ?? null,
-          last_inquiry_status: state.last_inquiry_status ?? null,
-        });
-      } else {
+        // 2) last enquiry snapshot (from org_customer_settings)
+        if (state.last_inquiry_text) {
+          setLastInquiry({
+            last_inquiry_text: state.last_inquiry_text,
+            last_inquiry_kind: state.last_inquiry_kind ?? null,
+            last_inquiry_canonical: state.last_inquiry_canonical ?? null,
+            last_inquiry_at: state.last_inquiry_at ?? null,
+            last_inquiry_status: state.last_inquiry_status ?? null,
+          });
+        } else {
+          setLastInquiry(null);
+        }
+      } catch (e) {
+        console.error("[Dashboard] getCustomerAutoReply failed", e);
         setLastInquiry(null);
       }
-    } catch (e) {
-      console.error("[Dashboard] getCustomerAutoReply failed", e);
-      setLastInquiry(null);
-    }
-  })();
-}, [isWaba, orgId, selected?.customer_phone, lastMessageKey]);
+    })();
+  }, [isWaba, orgId, selected?.customer_phone, lastMessageKey]);
 
   const refreshOrders = async () => {
     if (!orgId) return;
@@ -219,13 +253,13 @@ useEffect(() => {
   const handleToggleCustomerAutoReply = async (phoneRaw: string) => {
     if (!orgId || !phoneRaw) return;
     const phoneKey = phoneRaw.replace(/[^\d]/g, "");
-  
+
     const current = autoReplyMap[phoneKey] ?? true;
     const next = !current;
-  
+
     setAutoReplyBusy(true);
     setAutoReplyMap((prev) => ({ ...prev, [phoneKey]: next }));
-  
+
     try {
       await setCustomerAutoReply(orgId, phoneKey, next);
     } catch (e) {
@@ -262,8 +296,7 @@ useEffect(() => {
       }
 
       // 🔹 NEW: keep center order card in sync with inbox polling
-      await refreshOrders();   // <—— ADD THIS LINE
-
+      await refreshOrders();
     } catch (e) {
       console.error("[Inbox] conversations failed", e);
       setConversations([]);
@@ -297,8 +330,8 @@ useEffect(() => {
       );
   }, [isWaba, selected, orders]);
 
-   // For WABA: live vs past orders *per customer*
-   const liveCustomerOrders: Order[] = useMemo(
+  // For WABA: live vs past orders *per customer*
+  const liveCustomerOrders: Order[] = useMemo(
     () =>
       customerOrders.filter(
         (o) => o.status === "pending" || o.status === "shipped"
@@ -329,7 +362,7 @@ useEffect(() => {
     setSelectedOrderId(null);
   }, [selected?.customer_phone]);
 
-   // For WABA: main active order for the center card
+  // For WABA: main active order for the center card
   // Only treat pending + shipped as "active".
   const activeOrder: Order | null = useMemo(() => {
     if (!customerOrders.length) return null;
@@ -346,19 +379,6 @@ useEffect(() => {
     );
     return open[0] || null; // 👈 no fallback to a paid/cancelled order
   }, [customerOrders, selectedOrderId]);
-
-  
-    // Show the center inquiry card only when:
-    //  - we have a selected chat
-    //  - last message looks like an inquiry
-    //  - and auto-reply is OFF for this customer (AI paused)
-    // const showInquiryCard = !!(
-    //   selected &&
-    //   lastCustomerMessage &&
-    //   lastInquiryKind &&
-    //   customerAutoReply === false
-    // );
-
 
   // NEW: “customer may need help” heuristic
   const needsHelp = useMemo(() => {
@@ -390,20 +410,23 @@ useEffect(() => {
       const { data } = await api.get("/api/inbox/messages", {
         params: { phone: c.customer_phone, org_id: orgId },
       });
-  
+
       const rawArr = Array.isArray(data) ? data : [];
-  
+
       const mapped: Message[] = rawArr.map((m: any) => {
+        // Decide who sent it
         const from: "customer" | "store" =
           m.from ??
           (m.direction === "in" || m.sender_type === "customer"
             ? "customer"
             : "store");
-  
+
+        // Text body
         const text: string = m.text ?? m.body ?? "";
-  
+
+        // Timestamp
         const ts: string = m.ts ?? m.created_at ?? new Date().toISOString();
-  
+
         return {
           id: String(m.id || m.wa_msg_id || `${from}-${ts}-${text}`),
           from,
@@ -411,7 +434,7 @@ useEffect(() => {
           ts,
         };
       });
-  
+
       // 🔹 DEDUPE HERE – avoid duplicate bubbles for the same message
       const seen = new Set<string>();
       const deduped = mapped.filter((m) => {
@@ -420,7 +443,7 @@ useEffect(() => {
         seen.add(key);
         return true;
       });
-  
+
       setMessages(deduped);
     } catch (e) {
       console.error("[Inbox] messages failed", e);
@@ -446,10 +469,10 @@ useEffect(() => {
     if (!isWaba || !orgId || !selected || !input.trim()) return;
     const text = input.trim();
     setSending(true);
-  
+
     // Normalize once and reuse
     const phonePlain = String(selected.customer_phone || "").replace(/^\+/, "");
-  
+
     try {
       const optimistic: Message = {
         id: `local-${Date.now()}`,
@@ -458,25 +481,25 @@ useEffect(() => {
         ts: new Date().toISOString(),
       };
       setMessages((m) => [...m, optimistic]);
-  
+
       // Use wrapper
       await sendInboxMessage(orgId, phonePlain, text);
-  
+
       setInput("");
       await loadMessages(selected);
-  
+
       // If auto-reply was ON for this customer, turn it OFF after human reply
       if (customerAutoReply) {
         await handleToggleCustomerAutoReply(selected.customer_phone);
       }
-  
+
       // If there was an unresolved inquiry, mark it resolved (locally + backend)
       if (showInquiryCard && lastInquiry) {
         // Optimistic local update – hide card immediately
         setLastInquiry((prev) =>
           prev ? { ...prev, last_inquiry_status: "resolved" } : prev
         );
-  
+
         try {
           await markInquiryResolved(
             orgId,
@@ -499,9 +522,7 @@ useEffect(() => {
   // Merge the *current* active order into the previous open order (backend: /:id/merge-previous)
   const handleMergeActiveOrders = async () => {
     // 🔹 Only merge PENDING orders, ignore shipped/paid/cancelled
-    const pendingOrders = activeOrders.filter(
-      (o) => o.status === "pending"
-    );
+    const pendingOrders = activeOrders.filter((o) => o.status === "pending");
 
     if (pendingOrders.length < 2) {
       alert("Need at least 2 pending orders to merge.");
@@ -562,7 +583,8 @@ useEffect(() => {
       setAutoReplySaving(false);
     }
   };
-        // Smoothly open the QuickReplyPrice panel and scroll it into view
+
+  // Smoothly open the QuickReplyPrice panel and scroll it into view
   const openPricePanel = () => {
     setShowAvailPanel(false);
     setShowPricePanel(true);
@@ -587,11 +609,18 @@ useEffect(() => {
   // Greeting helper for quick replies (EXISTING)
   const customerName = selected?.customer_name?.trim() || "";
   const greeting = customerName ? `Hi ${customerName},` : "Hi,";
+
+  // For AI summary strip: last order time
+  const lastOrderTime = useMemo(() => {
+    if (!customerOrders.length) return null;
+    return customerOrders[0]?.created_at ?? null;
+  }, [customerOrders]);
+
   console.log("ORG:", org);
   console.log("ORG IN DASHBOARD BUTTON:", org);
 
-   // ───────────────── NON-WABA (local_bridge etc.) UI ─────────────────
-   if (!isWaba && org && !orgError) {
+  // ───────────────── NON-WABA (local_bridge etc.) UI ─────────────────
+  if (!isWaba && org && !orgError) {
     // derive live vs past lists for this org
     const liveOrders = orders.filter(
       (o) => o.status === "pending" || o.status === "shipped"
@@ -669,7 +698,7 @@ useEffect(() => {
 
           {!loadingOrders && visibleOrders.length === 0 && (
             <div className="text-slate-500 text-sm">
-             {orderFilter === "past"
+              {orderFilter === "past"
                 ? "No past orders yet (paid/cancelled)."
                 : orderFilter === "live"
                 ? "No active orders. New orders will appear here."
@@ -839,6 +868,60 @@ useEffect(() => {
                 </button>
               </div>
 
+              {/* NEW: AI summary strip */}
+              <div className="w-full mb-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-[10px] flex flex-wrap items-center justify-between gap-2">
+                <div className="space-y-[2px]">
+                  <div className="font-semibold text-slate-700 flex items-center gap-1">
+                    <span>👤 Customer</span>
+                    <span className="text-slate-900">
+                      {customerName || selected.customer_phone}
+                    </span>
+                  </div>
+                  <div className="text-slate-500">
+                    Orders:{" "}
+                    <span className="font-semibold">
+                      {customerOrders.length}
+                    </span>
+                    {activeOrders.length > 0 && (
+                      <>
+                        {" "}
+                        · Active:{" "}
+                        <span className="font-semibold">
+                          {activeOrders.length}
+                        </span>
+                      </>
+                    )}
+                    {lastOrderTime && (
+                      <>
+                        {" "}
+                        · Last order:{" "}
+                        {new Date(lastOrderTime).toLocaleDateString()}
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className="space-y-[2px] text-right text-slate-500">
+                  <div>
+                    🧠 AI:{" "}
+                    <span className="font-semibold">
+                      {customerAutoReply === false
+                        ? "Paused for this customer"
+                        : autoReplyEnabled
+                        ? "Handling routine replies"
+                        : "Org auto-reply OFF"}
+                    </span>
+                  </div>
+                  {lastInquiry?.last_inquiry_kind && (
+                    <div className="text-[9px] text-slate-500">
+                      Last question:{" "}
+                      <span className="font-semibold">
+                        {lastInquiry.last_inquiry_kind}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
               {/* Multi-order banner & history (EXISTING) */}
               {customerOrders.length > 1 && (
                 <div className="w-full mb-2 rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-2 text-[10px] text-indigo-900 flex items-center justify-between gap-2">
@@ -914,177 +997,185 @@ useEffect(() => {
                 </div>
               )}
 
+              {/* Center order + enquiry block */}
+              <div className="w-full space-y-2">
+                {loadingOrders && (
+                  <div className="text-[11px] text-slate-500">
+                    Loading order…
+                  </div>
+                )}
 
+                {/* CASE 1: No active order → show enquiry FIRST (if any), then the "no order" hint */}
+                {!activeOrder && (
+                  <>
+                    {showInquiryCard && lastInquiry?.last_inquiry_text && (
+                      <div className="w-full flex items-start justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
+                        <div className="space-y-1">
+                          <div className="font-semibold flex items-center gap-1">
+                            <span>❓ Customer question</span>
+                            <span className="text-[9px] px-2 py-[1px] rounded-full bg-amber-100 border border-amber-200">
+                              {customerAutoReply === false
+                                ? "AI paused"
+                                : "AI active"}
+                            </span>
+                          </div>
+                          <div className="text-[10px] italic text-amber-900">
+                            “{lastInquiry.last_inquiry_text}”
+                          </div>
+                          <div className="text-[10px] text-amber-800">
+                            {lastInquiry.last_inquiry_kind === "price" &&
+                              "AI detected a price question and couldn’t auto-answer."}
+                            {lastInquiry.last_inquiry_kind === "availability" &&
+                              "AI detected an availability question and couldn’t auto-answer."}
+                            {lastInquiry.last_inquiry_kind === "menu" &&
+                              "AI detected a menu / price-list question and couldn’t auto-answer."}{" "}
+                            Please reply from here.
+                          </div>
+                        </div>
 
-<div className="w-full space-y-2">
-  {loadingOrders && (
-    <div className="text-[11px] text-slate-500">Loading order…</div>
-  )}
+                        <div className="flex flex-col gap-1 text-[9px] shrink-0">
+                          {lastInquiry.last_inquiry_kind === "price" && (
+                            <button
+                              type="button"
+                              onClick={openPricePanel}
+                              className="rounded-full border border-amber-300 bg-white px-2 py-[3px] hover:bg-amber-100 text-amber-900"
+                            >
+                              💸 Open price reply
+                            </button>
+                          )}
+                          {lastInquiry.last_inquiry_kind ===
+                            "availability" && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setShowAvailPanel(true);
+                                setShowPricePanel(false);
+                              }}
+                              className="rounded-full border border-amber-300 bg-white px-2 py-[3px] hover:bg-amber-100 text-amber-900"
+                            >
+                              ✅ Availability reply
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const el =
+                                document.querySelector<HTMLInputElement>(
+                                  'input[placeholder="Type a reply to send on WhatsApp…"]'
+                                );
+                              if (el) el.focus();
+                            }}
+                            className="rounded-full border border-amber-300 bg-amber-600 px-2 py-[3px] text-white hover:bg-amber-500"
+                          >
+                            ✍️ Manual reply
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
-  {/* CASE 1: No active order → show enquiry FIRST (if any), then the "no order" hint */}
-  {!activeOrder && (
-    <>
-      {showInquiryCard && lastInquiry?.last_inquiry_text && (
-        <div className="w-full flex items-start justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
-          <div className="space-y-1">
-            <div className="font-semibold flex items-center gap-1">
-              <span>❓ Customer question</span>
-              <span className="text-[9px] px-2 py-[1px] rounded-full bg-amber-100 border border-amber-200">
-              {customerAutoReply === false ? "AI paused" : "AI active"}
-              </span>
-            </div>
-            <div className="text-[10px] italic text-amber-900">
-              “{lastInquiry.last_inquiry_text}”
-            </div>
-            <div className="text-[10px] text-amber-800">
-              {lastInquiry.last_inquiry_kind === "price" &&
-                "AI detected a price question and couldn’t auto-answer."}
-              {lastInquiry.last_inquiry_kind === "availability" &&
-                "AI detected an availability question and couldn’t auto-answer."}
-              {lastInquiry.last_inquiry_kind === "menu" &&
-                "AI detected a menu / price-list question and couldn’t auto-answer."}{" "}
-              Please reply from here.
-            </div>
-          </div>
+                    <div className="text-[11px] text-slate-500">
+                      No parsed order yet for this chat. Ask the customer for
+                      their list; AI will convert it to an order.
+                    </div>
+                  </>
+                )}
 
-          <div className="flex flex-col gap-1 text-[9px] shrink-0">
-            {lastInquiry.last_inquiry_kind === "price" && (
-              <button
-                type="button"
-                onClick={openPricePanel}
-                className="rounded-full border border-amber-300 bg-white px-2 py-[3px] hover:bg-amber-100 text-amber-900"
-              >
-                💸 Open price reply
-              </button>
-            )}
-            {lastInquiry.last_inquiry_kind === "availability" && (
-              <button
-                type="button"
-                onClick={() => {
-                  setShowAvailPanel(true);
-                  setShowPricePanel(false);
-                }}
-                className="rounded-full border border-amber-300 bg-white px-2 py-[3px] hover:bg-amber-100 text-amber-900"
-              >
-                ✅ Availability reply
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => {
-                const el =
-                  document.querySelector<HTMLInputElement>(
-                    'input[placeholder="Type a reply to send on WhatsApp…"]'
-                  );
-                if (el) el.focus();
-              }}
-              className="rounded-full border border-amber-300 bg-amber-600 px-2 py-[3px] text-white hover:bg-amber-500"
-            >
-              ✍️ Manual reply
-            </button>
-          </div>
-        </div>
-      )}
+                {/* CASE 2: We have an active order → Order card first, then enquiry below it */}
+                {activeOrder && (
+                  <>
+                    <OrderCard
+                      o={activeOrder as any}
+                      onChange={refreshOrders}
+                      modeHint="waba"
+                      orgId={orgId!}
+                    />
 
-      <div className="text-[11px] text-slate-500">
-        No parsed order yet for this chat. Ask the customer for
-        their list; AI will convert it to an order.
-      </div>
-    </>
-  )}
+                    {showInquiryCard && lastInquiry?.last_inquiry_text && (
+                      <div className="w-full flex items-start justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
+                        <div className="space-y-1">
+                          <div className="font-semibold flex items-center gap-1">
+                            <span>❓ Customer question</span>
+                            <span className="text-[9px] px-2 py-[1px] rounded-full bg-amber-100 border border-amber-200">
+                              {customerAutoReply === false
+                                ? "AI paused"
+                                : "AI active"}
+                            </span>
+                          </div>
+                          <div className="text-[10px] italic text-amber-900">
+                            “{lastInquiry.last_inquiry_text}”
+                          </div>
+                          <div className="text-[10px] text-amber-800">
+                            {lastInquiry.last_inquiry_kind === "price" &&
+                              "AI detected a price question and couldn’t auto-answer."}
+                            {lastInquiry.last_inquiry_kind ===
+                              "availability" &&
+                              "AI detected an availability question and couldn’t auto-answer."}
+                            {lastInquiry.last_inquiry_kind === "menu" &&
+                              "AI detected a menu / price-list question and couldn’t auto-answer."}{" "}
+                            Please reply from here.
+                          </div>
+                        </div>
 
-  {/* CASE 2: We have an active order → Order card first, then enquiry below it */}
-  {activeOrder && (
-    <>
-      <OrderCard
-        o={activeOrder as any}
-        onChange={refreshOrders}
-        modeHint="waba"
-        orgId={orgId!}
-      />
-
-      {showInquiryCard && lastInquiry?.last_inquiry_text && (
-        <div className="w-full flex items-start justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
-          <div className="space-y-1">
-            <div className="font-semibold flex items-center gap-1">
-              <span>❓ Customer question</span>
-              <span className="text-[9px] px-2 py-[1px] rounded-full bg-amber-100 border border-amber-200">
-              {customerAutoReply === false ? "AI paused" : "AI active"}
-              </span>
-            </div>
-            <div className="text-[10px] italic text-amber-900">
-              “{lastInquiry.last_inquiry_text}”
-            </div>
-            <div className="text-[10px] text-amber-800">
-              {lastInquiry.last_inquiry_kind === "price" &&
-                "AI detected a price question and couldn’t auto-answer."}
-              {lastInquiry.last_inquiry_kind === "availability" &&
-                "AI detected an availability question and couldn’t auto-answer."}
-              {lastInquiry.last_inquiry_kind === "menu" &&
-                "AI detected a menu / price-list question and couldn’t auto-answer."}{" "}
-              Please reply from here.
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-1 text-[9px] shrink-0">
-            {lastInquiry.last_inquiry_kind === "price" && (
-              <button
-                type="button"
-                onClick={openPricePanel}
-                className="rounded-full border border-amber-300 bg-white px-2 py-[3px] hover:bg-amber-100 text-amber-900"
-              >
-                💸 Open price reply
-              </button>
-            )}
-            {lastInquiry.last_inquiry_kind === "availability" && (
-              <button
-                type="button"
-                onClick={() => {
-                  setShowAvailPanel(true);
-                  setShowPricePanel(false);
-                }}
-                className="rounded-full border border-amber-300 bg-white px-2 py-[3px] hover:bg-amber-100 text-amber-900"
-              >
-                ✅ Availability reply
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => {
-                const el =
-                  document.querySelector<HTMLInputElement>(
-                    'input[placeholder="Type a reply to send on WhatsApp…"]'
-                  );
-                if (el) el.focus();
-              }}
-              className="rounded-full border border-amber-300 bg-amber-600 px-2 py-[3px] text-white hover:bg-amber-500"
-            >
-              ✍️ Manual reply
-            </button>
-          </div>
-        </div>
-      )}
-    </>
-  )}
-</div>
+                        <div className="flex flex-col gap-1 text-[9px] shrink-0">
+                          {lastInquiry.last_inquiry_kind === "price" && (
+                            <button
+                              type="button"
+                              onClick={openPricePanel}
+                              className="rounded-full border border-amber-300 bg-white px-2 py-[3px] hover:bg-amber-100 text-amber-900"
+                            >
+                              💸 Open price reply
+                            </button>
+                          )}
+                          {lastInquiry.last_inquiry_kind ===
+                            "availability" && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setShowAvailPanel(true);
+                                setShowPricePanel(false);
+                              }}
+                              className="rounded-full border border-amber-300 bg-white px-2 py-[3px] hover:bg-amber-100 text-amber-900"
+                            >
+                              ✅ Availability reply
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const el =
+                                document.querySelector<HTMLInputElement>(
+                                  'input[placeholder="Type a reply to send on WhatsApp…"]'
+                                );
+                              if (el) el.focus();
+                            }}
+                            className="rounded-full border border-amber-300 bg-amber-600 px-2 py-[3px] text-white hover:bg-amber-500"
+                          >
+                            ✍️ Manual reply
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
 
               {/* Smart reply chips (UNCHANGED, width full) */}
               <div className="w-full mt-2 space-y-2">
                 {selected && (
                   <>
                     <div className="flex flex-wrap gap-2 text-[9px]">
-                    <button
-  type="button"
-  onClick={handlePriceChipClick}
-  className={
-    "px-3 py-1 rounded-full border text-[9px] " +
-    (showPricePanel
-      ? "bg-purple-600 text-white border-purple-600"
-      : "bg-slate-100 border-slate-200 hover:bg-slate-50")
-  }
->
-  💸 Price reply
-</button>
+                      <button
+                        type="button"
+                        onClick={handlePriceChipClick}
+                        className={
+                          "px-3 py-1 rounded-full border text-[9px] " +
+                          (showPricePanel
+                            ? "bg-purple-600 text-white border-purple-600"
+                            : "bg-slate-100 border-slate-200 hover:bg-slate-50")
+                        }
+                      >
+                        💸 Price reply
+                      </button>
                       <button
                         type="button"
                         onClick={() => {
@@ -1149,16 +1240,16 @@ useEffect(() => {
 
                     {/* Slide-down panels only when clicked (UNCHANGED) */}
                     {showPricePanel && (
-  <div className="mt-2" id="quick-price-panel">
-    <QuickReplyPrice
-      mode="waba"
-      orgId={orgId}
-      phone={selected.customer_phone}
-      customerName={selected.customer_name}
-      currency="AED"
-    />
-  </div>
-)}
+                      <div className="mt-2" id="quick-price-panel">
+                        <QuickReplyPrice
+                          mode="waba"
+                          orgId={orgId}
+                          phone={selected.customer_phone}
+                          customerName={selected.customer_name}
+                          currency="AED"
+                        />
+                      </div>
+                    )}
                     {showAvailPanel && (
                       <div className="mt-2">
                         <QuickReplyAvailability
@@ -1213,23 +1304,79 @@ useEffect(() => {
           )}
         </div>
 
-                {/* RIGHT: full chat + NEW order history + analytics/settings */}
-                {showChat && (
+        {/* RIGHT: full chat + NEW order history + analytics/settings */}
+        {showChat && (
           <div className="w-72 border-l border-slate-200 bg-white flex flex-col min-h-0">
             <div className="px-3 py-2 border-b border-slate-200 text-[10px] font-semibold">
               Customer context
             </div>
 
-            <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-3 text-[9px]">
+            <div
+              ref={chatScrollRef}
+              onScroll={handleChatScroll}
+              className="relative flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-3 text-[9px]"
+            >
+              {/* Customer at a glance card */}
+              {selected && (
+                <div className="rounded-lg border border-slate-100 bg-slate-50 px-2 py-2 text-[9px] space-y-1">
+                  <div className="font-semibold text-slate-700 flex items-center gap-1">
+                    <span>👤</span>
+                    <span>{customerName || selected.customer_phone}</span>
+                  </div>
+                  <div className="text-slate-500">
+                    Orders:{" "}
+                    <span className="font-semibold">
+                      {customerOrders.length}
+                    </span>
+                    {activeOrders.length > 0 && (
+                      <>
+                        {" "}
+                        · Active:{" "}
+                        <span className="font-semibold">
+                          {activeOrders.length}
+                        </span>
+                      </>
+                    )}
+                    {lastOrderTime && (
+                      <>
+                        {" "}
+                        · Last:{" "}
+                        {new Date(lastOrderTime).toLocaleDateString()}
+                      </>
+                    )}
+                  </div>
+                  <div className="text-slate-500">
+                    AI status:{" "}
+                    <span className="font-semibold">
+                      {customerAutoReply === false
+                        ? "Paused for this customer"
+                        : autoReplyEnabled
+                        ? "Auto-reply ON"
+                        : "Auto-reply OFF"}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {/* Latest enquiry chip */}
+              {selected && lastInquiry?.last_inquiry_text && (
+                <div className="inline-flex max-w-full items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-[3px] text-[9px] text-amber-900">
+                  <span>❓ Latest enquiry:</span>
+                  <span className="truncate max-w-[140px]">
+                    “{lastInquiry.last_inquiry_text}”
+                  </span>
+                </div>
+              )}
+
               {/* 🔹 AI paused banner when auto-reply is OFF for this customer */}
               {selected && customerAutoReply === false && (
-                <div className="mb-2 inline-flex items-center gap-1 rounded-full bg-amber-50 border border-amber-200 px-2 py-[2px] text-[9px] text-amber-800">
+                <div className="inline-flex items-center gap-1 rounded-full bg-amber-50 border border-amber-200 px-2 py-[2px] text-[9px] text-amber-800">
                   <span>🤖</span>
                   <span>AI paused for this customer (human handling)</span>
                 </div>
               )}
 
-              {/* Full chat (EXISTING UI, just wrapped) */}
+              {/* Full chat */}
               <div>
                 <div className="mb-1 text-[10px] font-semibold text-slate-700">
                   Full chat with{" "}
@@ -1269,6 +1416,17 @@ useEffect(() => {
                     ))}
                 </div>
               </div>
+
+              {/* Jump to latest button */}
+              {showJumpToLatest && (
+                <button
+                  type="button"
+                  onClick={() => scrollChatToBottom(true)}
+                  className="absolute right-2 bottom-2 rounded-full bg-slate-900 text-white px-2 py-[3px] text-[9px] shadow-md"
+                >
+                  ⬇ Jump to latest
+                </button>
+              )}
             </div>
           </div>
         )}
